@@ -1,4 +1,5 @@
 import json
+import re
 import tempfile
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -64,12 +65,18 @@ class BossCollectorUnitTests(TestCase):
             "industry": ["100001", "100002"],
         }))
 
-        self.assertEqual(query["jobType"], ["0"])
+        self.assertEqual(query["jobType"], ["1901"])
         self.assertEqual(query["experience"], ["102,104"])
         self.assertEqual(query["degree"], ["203"])
         self.assertEqual(query["scale"], ["303"])
         self.assertEqual(query["salary"], ["405"])
         self.assertEqual(query["industry"], ["100001,100002"])
+
+    def test_job_types_use_boss_search_codes(self):
+        for label, code in (("全职", "1901"), ("兼职", "1903"), ("实习", "1902")):
+            with self.subTest(label=label):
+                query = parse_qs(build_boss_filter_query({"job_type": [label]}))
+                self.assertEqual(query, {"jobType": [code]})
 
     def test_boss_filters_reject_unknown_labels_and_query_injection(self):
         normalized = normalize_boss_search_filters({
@@ -98,6 +105,53 @@ class BossCollectorUnitTests(TestCase):
         self.assertIn("blocked", JS_DETECT_COLLECTION_RISK)
         self.assertIn("rate_limit", JS_DETECT_COLLECTION_RISK)
         self.assertIn("login_required", JS_DETECT_COLLECTION_RISK)
+
+    def test_blocked_url_detection_ignores_salary_filter_code_403(self):
+        """回归：config 开了 salary:[3-5K] 时，每个搜索 URL 都会带 &salary=403。
+
+        旧实现拿整条 URL 做结构性判定、且边界符含 "="，于是把薪资筛选码误判成 403 拦截页，
+        每次都写全局硬锁（persistent_risk_lock），冻结采集/发送/监测三个阶段。
+        本测试把修复钉死，并用「变异说明」保证它真的能抓到回归。
+        """
+        # 1) 先坐实前提：筛选码确实会出现在查询串里。
+        filters = build_boss_filter_query({"salary": ["3-5K"]})
+        self.assertEqual(parse_qs(filters)["salary"], ["403"])
+        search_url = SEARCH_URL.format(keyword="AI", city_code="101010100") + "&" + filters
+        self.assertIn("salary=403", search_url)
+
+        # 2) 结构性 URL 判定只能扫 pathname，查询串里的筛选码碰不到它。
+        #    用 access-denied 锁定那一条规则（title/text 两条规则也含 "forbidden"）。
+        self.assertIn("const path = String(location.pathname", JS_DETECT_COLLECTION_RISK)
+        rules = [
+            line for line in JS_DETECT_COLLECTION_RISK.splitlines()
+            if "access-denied" in line and ".test(" in line
+        ]
+        path_rules = [line for line in rules if ".test(path)" in line]
+        self.assertEqual(len(path_rules), 1, "blocked_url 的路径判定规则应当只有一条")
+        # 变异 1：任何一条规则改回扫整条 URL，本断言都会失败。
+        self.assertEqual([line for line in rules if ".test(url)" in line], [])
+        rule = path_rules[0]
+        self.assertIn(".test(path)", rule)
+        self.assertNotIn(".test(url)", rule)
+        # 变异 2：把 = / ? / # 加回边界字符类，本断言会失败。
+        boundary_classes = re.findall(r"\[([^\]]*)\]", rule)
+        self.assertEqual(len(boundary_classes), 2)
+        for char_class in boundary_classes:
+            self.assertIn("\\/", char_class)
+            for forbidden in ("=", "?", "&", "#"):
+                self.assertNotIn(forbidden, char_class)
+        # 变异 3：查询串侧只允许 code/status/error 类参数名、且取值本身就是错误码
+        #          （上游 #164 同语义）；参数名或取值放宽成扫整条 URL 都会被抓住。
+        self.assertIn("/^(?:code|status|error|error_code|status_code)$/i.test(key)",
+                      JS_DETECT_COLLECTION_RISK)
+        self.assertIn("&& /^(?:403|forbidden|access-denied)$/i.test(value)",
+                      JS_DETECT_COLLECTION_RISK)
+        # 3) URL / 标题类判定一律受 hasExpectedContent 闸门保护。
+        self.assertIn("!hasExpectedContent", rule)
+
+        # 4) 软硬分离：JS 必须回传 severity，文本类提示只暂停本轮、不写全局硬锁。
+        self.assertIn("severity", JS_DETECT_COLLECTION_RISK)
+        self.assertIn("'soft'", JS_DETECT_COLLECTION_RISK)
 
 
 class BossCollectorCollectionTests(TestCase):
@@ -167,6 +221,20 @@ class BossCollectorCollectionTests(TestCase):
         )
         self.assertEqual(result.status, "blocked")
         self.assertEqual(result.reason_code, "captcha")
+
+    def test_blocked_risk_stops_collection(self):
+        browser = self._make_browser(risk="blocked")
+        hooks, _ = self._make_hooks()
+        result = BossCollector(
+            browser=browser,
+            throttle_factory=lambda **_kw: self._make_throttle(),
+            randint=lambda _a, _b: 5,
+        ).collect(
+            PlatformCollectionRequest("boss", ["AI"], ["北京"], {"北京": "101010100"}, max_pages=1),
+            hooks,
+        )
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.reason_code, "blocked")
 
     def test_rate_limit_risk_stops_collection(self):
         browser = self._make_browser(risk="rate_limit")

@@ -2,6 +2,7 @@
 
 import json
 import tempfile
+from contextlib import closing
 from pathlib import Path
 from unittest import TestCase
 from unittest.mock import Mock
@@ -25,9 +26,11 @@ def card(job_id, salary="\ue033\ue036-\ue036\ue031K·\ue032\ue036薪"):
 
 
 class SearchBrowser:
-    def __init__(self, batches, *, scrolling=True):
+    def __init__(self, batches, *, scrolling=True,
+                 detail_salary="\ue033\ue036-\ue036\ue031K·\ue032\ue036薪"):
         self.batches = batches
         self.scrolling = scrolling
+        self.detail_salary = detail_salary
         self.page = 0
         self.urls = {}
         self.opens = []
@@ -69,7 +72,7 @@ class SearchBrowser:
         if script == JS_EXTRACT_DETAIL:
             assert "/job_detail/" in self.urls[target]
             return json.dumps({"title": "AI运营", "company": "测试公司", "jd": "负责AI运营",
-                               "salary": "\ue033\ue036-\ue036\ue031K·\ue032\ue036薪"})
+                               "salary": self.detail_salary})
         return None
 
     def browser(self):
@@ -107,7 +110,7 @@ class BossSearchRegressionTests(TestCase):
                 }},
             })
             self.assertEqual(result["collected_job_ids"], ["new-job"])
-            with get_db(path) as conn:
+            with closing(get_db(path)) as conn:
                 row = conn.execute("SELECT salary FROM jobs WHERE id='new-job'").fetchone()
                 self.assertEqual(row["salary"], "25-50K·15薪")
         self.assertEqual(decode_boss_text("\ue031\ue032\ue033\ue034\ue035\ue036\ue037\ue038\ue039\ue03a"), "0123456789")
@@ -123,12 +126,49 @@ class BossSearchRegressionTests(TestCase):
         self.assertFalse(any(e.get("increment_filtered") for e in self.events))
         self.assertEqual(len(self.errors), 1)
 
+    def test_unknown_font_can_keep_job_with_empty_salary_when_configured(self):
+        browser = SearchBrowser([[card("new-job", "\ue123-\ue124K")]],
+                                detail_salary="\ue123-\ue124K")
+        result = self.collector(
+            browser,
+            profile={"filter_unparsed_salary": False},
+            collection={"boss_salary_decode_failure": "skip_job"},
+        ).collect(
+            PlatformCollectionRequest("boss", ["AI"], ["北京"], {}, max_pages=1), self.hooks())
+
+        self.assertNotEqual(result.reason_code, "salary_decode_failed")
+        self.assertTrue(all("薪资" not in error for error in self.errors), self.errors)
+        # An unreadable font must never be stored as a guessed number.
+        self.assertEqual([candidate.salary for candidate in self.saved], [""])
+
+    def test_unknown_font_keeps_readable_detail_salary_when_configured(self):
+        browser = SearchBrowser([[card("new-job", "\ue123-\ue124K")]])
+        self.collector(
+            browser,
+            profile={"filter_unparsed_salary": False},
+            collection={"boss_salary_decode_failure": "skip_job"},
+        ).collect(
+            PlatformCollectionRequest("boss", ["AI"], ["北京"], {}, max_pages=1), self.hooks())
+
+        self.assertEqual([candidate.salary for candidate in self.saved], ["25-50K·15薪"])
+
+    def test_salary_decode_failure_action_defaults_to_stop(self):
+        from bosshunter.collection.platforms.boss import _salary_decode_failure_action
+
+        self.assertEqual(_salary_decode_failure_action({}), "stop")
+        self.assertEqual(_salary_decode_failure_action(None), "stop")
+        self.assertEqual(_salary_decode_failure_action({"collection": {}}), "stop")
+        self.assertEqual(_salary_decode_failure_action(
+            {"collection": {"boss_salary_decode_failure": "guess"}}), "stop")
+        self.assertEqual(_salary_decode_failure_action(
+            {"collection": {"boss_salary_decode_failure": "skip_job"}}), "skip_job")
+
     def test_scroll_appends_only_new_ids_and_keeps_search_open_during_details(self):
         browser = SearchBrowser([[card("a")], [card("a"), card("b")],
                                  [card("a"), card("b"), card("c")]])
-        with tempfile.TemporaryDirectory() as tmp:
-            conn = get_db(Path(tmp) / "jobs.db")
-            self.addCleanup(conn.close)
+        # conn 必须在临时目录销毁前关闭：addCleanup 跑在 with 之外，
+        # Windows 上未释放的句柄会让 jobs.db 删不掉（Linux 不报错，CI 看不见）。
+        with tempfile.TemporaryDirectory() as tmp, closing(get_db(Path(tmp) / "jobs.db")) as conn:
             result = self.collector(browser, conn).collect(
                 PlatformCollectionRequest("boss", ["AI"], ["北京"], {}, max_pages=3), self.hooks())
             self.assertEqual(result.status, "completed")
@@ -173,9 +213,7 @@ class BossSearchRegressionTests(TestCase):
 
     def test_scroll_respects_daily_limit_before_loading_more(self):
         browser = SearchBrowser([[card("a")], [card("a"), card("b")]])
-        with tempfile.TemporaryDirectory() as tmp:
-            conn = get_db(Path(tmp) / "jobs.db")
-            self.addCleanup(conn.close)
+        with tempfile.TemporaryDirectory() as tmp, closing(get_db(Path(tmp) / "jobs.db")) as conn:
             result = self.collector(browser, conn, collection={"daily_search_page_limit": 1}).collect(
                 PlatformCollectionRequest("boss", ["AI"], ["北京"], {}, max_pages=3), self.hooks())
             self.assertEqual(result.reason_code, "daily_search_page_limit")

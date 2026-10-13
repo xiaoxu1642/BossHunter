@@ -44,6 +44,9 @@ src/bosshunter/web/frontend/dist/
 output/
 tmp/
 
+# Local run logs (Start-Transcript output from scripts/windows/start_bosshunter.ps1)
+logs/
+
 # OS
 .DS_Store
 Thumbs.db
@@ -53,3 +56,6 @@ Thumbs.db
 .superpowers/
 docs/superpowers/
 AGENTS.md
+# Local maintainer working docs (proposals/playbooks, not for VCS)
+PROPOSAL_*.md
+PR_REVIEW_PLAYBOOK.md
