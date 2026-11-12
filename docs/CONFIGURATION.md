@@ -11,15 +11,26 @@
 | `profile` | `resume_path`, `salary_min/max`, `deal_breakers` | 简历、期望薪资与排除条件 |
 | `search` | `keywords`, `cities`, `max_pages` | 默认搜索策略 |
 | `platforms` | `boss`, `zhilian`, `51job`, `liepin` | 各平台开关与独立搜索条件 |
-| `collection` | `daily_search_page_limit`, `risk_pause_*` | 采集额度与风险暂停策略 |
+| `collection` | `collect_windows`, `daily_search_page_limit`, `risk_pause_*` | 单次采集时间窗口、采集额度与风险暂停策略 |
 | `scoring` | `threshold`, `max_candidates` | 评分阈值与候选数量 |
-| `throttle` | `daily_limit`, `interval_min/max`, `send_windows` | 低频发送策略 |
+| `throttle` | `daily_limit`, `interval_min/max`, `send_windows` | 低频发送、监测与后台截止策略 |
 | `ai` | `service`, `provider`, `model`, `base_url` | AI 服务与接口；凭据由本地面板单独保存 |
 | `monitor` | `interval`, `max_resume_sends_per_cycle` | 回复监听设置 |
 | `follow_up` | `enabled`, `interval_hours`, `skip_weekends` | 跟进策略 |
 | `browser` | `chrome_ports`, `proxy_port` | Chrome 与本地代理连接 |
 
-完整字段、默认值和注释以 [`config.example.yaml`](../config.example.yaml) 为准。
+完整字段、默认值和注释以本机 `config.yaml` 与配置页为准。
+
+采集与发送时间窗口彼此独立：
+
+```yaml
+collection:
+  collect_windows: ["06:00-11:30", "13:30-22:30"]  # 单次采集
+throttle:
+  send_windows: ["08:30-12:30", "13:30-18:30"]      # 发送、监测与后台截止
+```
+
+两类窗口都按本机时间执行，包含开始、不包含结束；不支持跨午夜、重复或重叠。持续采集会话沿用自身截止，不受 `collect_windows` 限制。
 
 ## 平台配置边界
 
@@ -56,6 +67,20 @@ bosshunter ai-status
 ## 推荐的保守设置
 
 - 保持合理的 `daily_limit` 和随机发送间隔。
-- 限定 `send_windows`，避免长时间连续运行。
+- 分别限定 `send_windows`（发送/监测）和 `collection.collect_windows`（单次采集），避免长时间连续运行。
 - 不关闭人工确认。
 - 不提高默认访问频率，也不要尝试绕过验证码、登录墙或平台限制。
+
+## BOSS 仅实习筛选
+
+- 在 BOSS 搜索条件中将职位类型单独设为「实习」，并启用 `profile.allow_internship`。
+  同时选择全职/兼职时，不会启用「仅实习」拦截；其他平台不受此规则影响。
+  若未开启接受实习却选择仅实习，启动时会明确报配置冲突，不打开浏览器或入库。
+  即使没有仅实习筛选，BOSS 详情明确为实习且未开启接受实习时，详情后和发送前仍会拦截。
+- 采集器同时核对搜索 URL 与页面选中项。若无法确认筛选已生效，会停止该平台本轮采集，
+  提示人工核对，不悄悄退回不带筛选的搜索。
+- 列表缺少类型时继续读详情；依据标题与 JD 中明确的职位类型判断。
+  「校招」「日薪」「有实习经历优先」不单独构成实习证据。冲突或无法判断的岗位会被过滤。
+- AI 预筛和发送前再次核对，因此旧岗位记录也不能绕过仅实习限制。
+  原有人工确认、薪资/排除词规则、发送额度、节流、验证码及风险暂停机制保持不变。
+- 页面展示独立的职位类型和待核实原因；不修改已有记录中的校招/社招字段，也不做数据库迁移。

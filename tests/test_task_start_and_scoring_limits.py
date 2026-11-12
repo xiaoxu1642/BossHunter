@@ -92,6 +92,8 @@ def runtime(tmp_path, monkeypatch):
     assert runner.status()["active"] is None
 
 
+# These are completion checks, not performance benchmarks; Windows SQLite can
+# need more than 30 seconds for 1001 jobs and their persisted checkpoints.
 def seed_jobs(path, count, status="pending"):
     db = db_module.get_db(path)
     try:
@@ -227,7 +229,7 @@ def test_all_scoring_completes_1001_jobs(runtime, scope):
     assert status == 200 and preview["eligible_jobs"] == 1001
     status, started = request("/api/scoring/start", {"options": options})
     assert status == 200, started
-    runner.wait(timeout=30)
+    runner.wait(timeout=120)
     run = get_scoring_run(path, started["run"]["id"])
     assert run["status"] == runner.status()["last_task"]["status"] == "completed"
     assert run["remaining_job_ids"] == []
@@ -248,7 +250,7 @@ def test_manual_selection_rejects_1001_ids_but_accepts_1000(runtime, endpoint):
     status, accepted = request(f"/api/scoring/{endpoint}", {"options": options})
     assert status == 200, accepted
     if endpoint == "start":
-        runner.wait(timeout=30)
+        runner.wait(timeout=120)
         assert runner.status()["last_task"]["status"] == "completed"
         assert_all_scored(path, 1000)
     else:
@@ -261,7 +263,7 @@ def test_resume_handles_1001_remaining_jobs_without_rescoring_completed_job(runt
     ai.side_effect = [SCORE_RESPONSE, AIRequestError("token_quota", "模拟额度耗尽", 429)]
     status, started = request("/api/scoring/start", {"scope": "pending", "limit": None})
     assert status == 200, started
-    runner.wait(timeout=30)
+    runner.wait(timeout=120)
     run_id = started["run"]["id"]
     paused = get_scoring_run(path, run_id)
     assert paused["status"] == "paused"
@@ -270,7 +272,7 @@ def test_resume_handles_1001_remaining_jobs_without_rescoring_completed_job(runt
     ai.side_effect = None
     status, resumed = request(f"/api/scoring/runs/{run_id}/resume", {})
     assert status == 200, resumed
-    runner.wait(timeout=30)
+    runner.wait(timeout=120)
     finished = get_scoring_run(path, run_id)
     assert finished["status"] == "completed" and finished["remaining_job_ids"] == []
     assert ai.call_count == 1003  # One success + one quota pause + 1001 remaining jobs.
@@ -294,7 +296,7 @@ def test_collection_auto_scores_1001_new_jobs(runtime, monkeypatch):
         "mode": "collect", "options": collection_options(auto_score=True),
     })
     assert status == 200, started
-    runner.wait(timeout=30)
+    runner.wait(timeout=120)
     assert runner.status()["last_task"]["status"] == "completed"
     assert ai.call_count == 1001
     assert_all_scored(path, 1001)

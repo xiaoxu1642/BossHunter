@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +74,8 @@ DEFAULTS: dict[str, Any] = {
         "education": "",
         "recruitment_type": "",
         "greeting_preference": "",
+        "ai_greeting_enabled": True,
+        "fixed_greeting": "",
         "salary_min": 0,
         "salary_max": 0,
         "salary_ceil_ratio": 1.5,
@@ -93,8 +96,9 @@ DEFAULTS: dict[str, Any] = {
     "collection": {
         "default_order": ["boss"],
         "auto_score_default": False,
+        "collect_windows": ["09:00-16:00"],
         "daily_search_page_limit": 60,
-        "daily_detail_page_limit": 150,
+        "daily_detail_page_limit": 900,
         "max_consecutive_page_failures": 3,
         "risk_pause_min_minutes": 5,
         "risk_pause_max_minutes": 10,
@@ -112,6 +116,7 @@ DEFAULTS: dict[str, Any] = {
                 "max_pages": 3,
                 "sort": "default",
                 "filters": {},
+                "city_yield_policy": {"enabled": True, "warmup_minutes": 10, "window_minutes": 5, "min_new_jobs": 5},
             },
         },
         "zhilian": {
@@ -137,11 +142,30 @@ DEFAULTS: dict[str, Any] = {
         "liepin": {
             "enabled": False,
             "search": {
-                "keywords": [],
+                # 猎聘默认关键词：按本地历史采集的高分率挑选（详见
+                # docs/liepin-risk-control-plan.md）。
+                # 文员 71% / AI内容运营 42% / 行政 33%。三个词分属三个
+                # 岗位族，互不重复覆盖；猎聘搜索有模糊匹配，"文员"已能带出
+                # 文职、前台文员，"AI内容运营"能带出新媒体运营。
+                # 故意不放 AI测试/公共事务/pr/直播中控——历史数据显示它们
+                # 高分率 ≤8%，在猎聘搜不到匹配岗位，只烧详情页额度。
+                "keywords": ["文员", "行政", "AI内容运营"],
                 "cities": [],
                 "city_codes": {},
                 "max_pages": 1,
                 "sort": "default",
+                # 猎聘专属采集限额。全局 collection.daily_detail_page_limit
+                # 默认 900 是 BOSS 口径，对猎聘是 15 倍超发，不能沿用：
+                # JobKoi-AI 的封号复盘结论是「日总量是最强杠杆」，其猎聘
+                # 日额 15（打招呼，写操作）；采集只读，取 40 作真人浏览上限，
+                # 单轮再收一道 30，鼓励分次运行。
+                # 2026-11-12：日额 60 → 40（60 档实测仍触发风控）。
+                "daily_search_page_limit": 40,
+                "daily_detail_page_limit": 40,
+                "run_detail_page_limit": 30,
+                # P3：详情 JD 走纯 HTTP（HTML 首包就带 JD，见
+                # docs/liepin-risk-control-plan.md）。关掉即回到纯浏览器流程。
+                "http_detail_enabled": True,
             },
         },
     },
@@ -174,7 +198,7 @@ DEFAULTS: dict[str, Any] = {
         "greeting_review_max_tokens": 4096,
         "greeting_max_attempts": 2,
         "greeting_review_threshold": 7.0,
-        "greeting_max_iterations": 2,
+        "greeting_style_suggestions": False,
     },
     "monitor": {
         "interval": 30,  # 分钟
@@ -190,11 +214,8 @@ DEFAULTS: dict[str, Any] = {
         "interval_hours": 48,
         "skip_weekends": True,
     },
-    "dedup": {
-        "history_file": "./data/history.jsonl",
-    },
     "safety": {
-        "daily_platform_page_limit": 500,
+        "daily_platform_page_limit": 1100,
         "risk_lock_minutes": 10,
     },
     "browser": {
@@ -232,13 +253,17 @@ def load_config(config_path: Path | None = None) -> dict[str, Any]:
         _deep_merge(cfg, user_cfg)
     _normalize_config_sections(cfg)
     _validate_ai_provider(cfg)
+    validate_config_send_windows(cfg)
     return cfg
 
 
 def save_config(config: dict[str, Any], config_path: Path | None = None) -> None:
     """Persist settings without writing AI credentials to config.yaml."""
+    validate_config_send_windows(config)
     config_path = Path(config_path or "config.yaml")
     public_config = _deep_copy_dict(config)
+    _normalize_internship_salary_filter(public_config)
+    remove_retired_collection_settings(public_config)
     ai_cfg = public_config.get("ai")
     credentials: dict[str, Any] = {}
     if isinstance(ai_cfg, dict):
@@ -260,10 +285,31 @@ def save_config(config: dict[str, Any], config_path: Path | None = None) -> None
             pass
 
 
+def validate_config_send_windows(config: dict[str, Any]) -> None:
+    """Reject invalid send or collection windows before persisting or starting."""
+    from bosshunter.throttle import validate_time_windows
+
+    throttle = config.get("throttle", {})
+    if not isinstance(throttle, dict):
+        raise ValueError("throttle 必须是配置对象")  # noqa: TRY004 - configuration validation reports ValueError
+    validate_time_windows(
+        throttle.get("send_windows", DEFAULTS["throttle"]["send_windows"]),
+        field="throttle.send_windows",
+    )
+    collection = config.get("collection", {})
+    if not isinstance(collection, dict):
+        raise ValueError("collection 必须是配置对象")  # noqa: TRY004
+    validate_time_windows(
+        collection.get("collect_windows", DEFAULTS["collection"]["collect_windows"]),
+        field="collection.collect_windows",
+    )
+
+
 def migrate_legacy_credentials(config_path: Path | None = None) -> bool:
     """Move credentials out of an existing config.yaml on the next startup."""
     config_path = Path(config_path or "config.yaml")
     public_config = _load_yaml_mapping(config_path)
+    _normalize_internship_salary_filter(public_config)
     ai_cfg = public_config.get("ai")
     if not isinstance(ai_cfg, dict):
         return False
@@ -303,6 +349,10 @@ def _load_yaml_mapping(path: Path) -> dict[str, Any]:
     return content if isinstance(content, dict) else {}
 
 
+_REPLACE_ATTEMPTS = 5
+_REPLACE_BACKOFF_SECONDS = 0.05
+
+
 def _write_yaml_atomic(path: Path, data: dict[str, Any]) -> None:
     """Atomically write a local YAML file with owner-only permissions."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -321,7 +371,7 @@ def _write_yaml_atomic(path: Path, data: dict[str, Any]) -> None:
             temporary.flush()
             os.fsync(temporary.fileno())
         os.chmod(temporary_path, 0o600)
-        os.replace(temporary_path, path)
+        _replace_with_retry(temporary_path, path)
         temporary_path = None
     finally:
         if temporary_path is not None:
@@ -331,21 +381,42 @@ def _write_yaml_atomic(path: Path, data: dict[str, Any]) -> None:
                 pass
 
 
+def _replace_with_retry(source: Path, target: Path) -> None:
+    """Windows rejects the rename while the target is briefly open elsewhere."""
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(_REPLACE_BACKOFF_SECONDS * (attempt + 1))
+
+
+def _normalize_internship_salary_filter(config: dict[str, Any]) -> None:
+    """Daily internship pay must not be rejected as an unparsed monthly salary."""
+    profile = config.get("profile")
+    if isinstance(profile, dict) and profile.get("allow_internship") is True:
+        profile["filter_unparsed_salary"] = False
+
+
 def _normalize_config_sections(config: dict[str, Any]) -> dict[str, Any]:
     """Replace malformed sections and discard retired collection-count settings."""
     for section, defaults in DEFAULTS.items():
         if isinstance(defaults, dict) and not isinstance(config.get(section), dict):
             config[section] = _deep_copy_dict(defaults)
 
+    _normalize_internship_salary_filter(config)
     return remove_retired_collection_settings(config)
 
 
 def remove_retired_collection_settings(config: dict[str, Any]) -> dict[str, Any]:
-    """Remove collection-count settings that are no longer supported."""
+    """Remove collection-count and dead dedup-file settings."""
 
     # These settings existed briefly, but a result-count limit is not a page-access
     # safety control. Ignore stale values so old config files cannot re-enable it or
     # make the removed fields reappear in the Web UI/API.
+    config.pop("dedup", None)
     collection = config.get("collection", {})
     collection.pop("daily_new_jobs_limit", None)
     collection.pop("default_target_count", None)

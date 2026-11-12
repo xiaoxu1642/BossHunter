@@ -225,8 +225,8 @@ class ZhilianFixtureTests(TestCase):
     def test_collector_uses_shared_runtime_and_stops_at_target(self):
         responses = {
             "list": json.dumps({"items": [
-                {"source_job_id": "zl-1", "title": "岗位一", "company": "公司一", "city": "北京"},
-                {"source_job_id": "zl-2", "title": "岗位二", "company": "公司二", "city": "北京"},
+                {"source_job_id": "zl-1", "title": "岗位一", "company": "公司一", "city": "北京", "salary": "15-25K"},
+                {"source_job_id": "zl-2", "title": "岗位二", "company": "公司二", "city": "北京", "salary": "15-25K"},
             ]}),
             "detail": json.dumps({"source_job_id": "zl-1", "title": "岗位一", "company": "公司一", "city": "北京", "jd": "JD"}),
         }
@@ -263,7 +263,7 @@ class ZhilianFixtureTests(TestCase):
     def test_collector_submits_keyword_through_shared_browser_input_actions(self):
         responses = {
             "list": json.dumps({"items": [
-                {"source_job_id": "zl-1", "title": "岗位一", "company": "公司一", "city": "北京", "url": "/job/1.html"},
+                {"source_job_id": "zl-1", "title": "岗位一", "company": "公司一", "city": "北京", "salary": "15-25K", "url": "/job/1.html"},
             ]}),
             "detail": json.dumps({"source_job_id": "zl-1", "title": "岗位一", "company": "公司一", "city": "北京", "jd": "JD"}),
         }
@@ -428,6 +428,20 @@ class ZhilianEnhancedTests(TestCase):
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.reason_code, "day_off")
 
+    def test_collection_window_is_independent_of_send_window(self):
+        collector = ZhilianCollector(config={
+            "throttle": {"send_windows": ["08:30-12:30", "13:30-18:30"]},
+            "collection": {"collect_windows": ["06:00-11:30", "13:30-22:30"]},
+        })
+        with patch("bosshunter.collection.platforms.zhilian.SendWindowChecker") as checker:
+            checker.return_value.is_active.return_value = False
+            result = collector.collect(
+                PlatformCollectionRequest("zhilian", ["AI"], ["北京"], {"北京": "530"}, max_pages=1),
+                self._hooks(),
+            )
+        checker.assert_called_once_with(["06:00-11:30", "13:30-22:30"])
+        self.assertEqual(result.reason_code, "outside_window")
+
     def test_deal_breaker_filter(self):
         from bosshunter.collection.models import JobCandidate
         collector = ZhilianCollector(config={"profile": {"deal_breakers": ["外包"]}})
@@ -455,6 +469,42 @@ class ZhilianEnhancedTests(TestCase):
         c = JobCandidate(platform="zhilian", source_job_id="1", title="AI工程师",
                          company="公司", city="北京", city_code="530")
         self.assertTrue(collector._passes_filters(c))
+
+    def test_salary_below_min_blocked(self):
+        from bosshunter.collection.models import JobCandidate
+        collector = ZhilianCollector(config={"profile": {"salary_min": 10, "salary_max": 20}})
+        c = JobCandidate(platform="zhilian", source_job_id="1", title="AI工程师",
+                         company="公司", city="北京", city_code="530", salary="5-8K")
+        self.assertIsNotNone(collector._salary_block_reason(c))
+
+    def test_salary_unparsable_blocked_by_default(self):
+        from bosshunter.collection.models import JobCandidate
+        collector = ZhilianCollector(config={"profile": {"salary_min": 10, "salary_max": 20}})
+        c = JobCandidate(platform="zhilian", source_job_id="1", title="AI工程师",
+                         company="公司", city="北京", city_code="530", salary="面议")
+        self.assertIsNotNone(collector._salary_block_reason(c))
+
+    def test_salary_within_range_passes(self):
+        from bosshunter.collection.models import JobCandidate
+        collector = ZhilianCollector(config={"profile": {"salary_min": 10, "salary_max": 20}})
+        c = JobCandidate(platform="zhilian", source_job_id="1", title="AI工程师",
+                         company="公司", city="北京", city_code="530", salary="1-2万")
+        self.assertIsNone(collector._salary_block_reason(c))
+
+    def test_salary_parsed_passes_without_thresholds(self):
+        from bosshunter.collection.models import JobCandidate
+        collector = ZhilianCollector()
+        c = JobCandidate(platform="zhilian", source_job_id="1", title="AI工程师",
+                         company="公司", city="北京", city_code="530", salary="15-25K")
+        self.assertIsNone(collector._salary_block_reason(c))
+
+    def test_salary_unparsed_blocked_by_default_even_without_thresholds(self):
+        # 与 BOSS 列表预筛同规则：默认 filter_unparsed_salary=True。
+        from bosshunter.collection.models import JobCandidate
+        collector = ZhilianCollector()
+        c = JobCandidate(platform="zhilian", source_job_id="1", title="AI工程师",
+                         company="公司", city="北京", city_code="530", salary="面议")
+        self.assertIsNotNone(collector._salary_block_reason(c))
 
 
 class ZhilianResumeCheckpointTests(TestCase):
@@ -508,7 +558,7 @@ class ZhilianResumeCheckpointTests(TestCase):
         return {"source_job_id": job_id, "title": "AI", "company": "公司",
                 "city": "北京", "url": f"/job/{job_id}.html"}
 
-    def test_completed_combo_skipped_entirely(self):
+    def test_full_page_checkpoint_skips_keyword(self):
         browser = self._browser_with_pages({1: [self._job()]})
         collected = []
         events = []
@@ -521,20 +571,21 @@ class ZhilianResumeCheckpointTests(TestCase):
             patch("bosshunter.collection.platforms.zhilian.should_take_day_off", return_value=False),
             patch("bosshunter.collection.platforms.zhilian.prune_collected_combos"),
             patch("bosshunter.collection.platforms.zhilian.prune_page_progress"),
-            patch("bosshunter.collection.platforms.zhilian.get_collected_combos", return_value={("北京", "AI")}),
-            patch("bosshunter.collection.platforms.zhilian.get_page_progress", return_value=0),
+            patch("bosshunter.collection.platforms.zhilian.get_page_progress", return_value=1),
             patch("bosshunter.collection.platforms.zhilian.upsert_page_progress"),
-            patch("bosshunter.collection.platforms.zhilian.mark_combo_collected"),
-            patch("bosshunter.collection.platforms.zhilian.delete_page_progress"),
+            patch("bosshunter.collection.platforms.zhilian.mark_combo_collected") as mark_complete,
         ):
             result = collector.collect(
                 PlatformCollectionRequest("zhilian", ["AI"], ["北京"], {"北京": "530"}, max_pages=1),
                 self._hooks(collected, events),
             )
         self.assertEqual(result.status, "completed")
+        self.assertEqual(result.reason_code, "no_remaining_pages")
         self.assertEqual(len(collected), 0)
+        mark_complete.assert_called_once()
         skip_events = [e for e in events if e.get("phase") == "completed_keyword"]
-        self.assertTrue(any("断点续采" in str(e.get("message", "")) for e in skip_events))
+        self.assertTrue(any("已采到最大页" in str(e.get("message", "")) for e in skip_events))
+        self.assertEqual(skip_events[-1].get("skipped"), 1)
 
     def test_pages_are_checkpointed_in_ascending_order(self):
         browser = self._browser_with_pages({1: [self._job()], 2: [self._job("zl-2")], 3: None})
@@ -549,23 +600,23 @@ class ZhilianResumeCheckpointTests(TestCase):
             patch("bosshunter.collection.platforms.zhilian.should_take_day_off", return_value=False),
             patch("bosshunter.collection.platforms.zhilian.prune_collected_combos"),
             patch("bosshunter.collection.platforms.zhilian.prune_page_progress"),
-            patch("bosshunter.collection.platforms.zhilian.get_collected_combos", return_value=set()),
             patch("bosshunter.collection.platforms.zhilian.get_page_progress", return_value=0),
             patch("bosshunter.collection.platforms.zhilian.upsert_page_progress",
                   side_effect=lambda _c, _s, _ci, _k, page: checkpoints.append(page)),
             patch("bosshunter.collection.platforms.zhilian.mark_combo_collected"),
-            patch("bosshunter.collection.platforms.zhilian.delete_page_progress"),
         ):
             result = collector.collect(
                 PlatformCollectionRequest("zhilian", ["AI"], ["北京"], {"北京": "530"}, max_pages=3),
                 self._hooks(collected),
             )
         self.assertEqual(result.status, "completed")
-        self.assertEqual(checkpoints, [1, 2])
+        # 空页把断点推进到上限页，避免下次重复探测同一空页
+        self.assertEqual(checkpoints, [1, 2, 3])
 
-    def test_word_completion_marks_combo_and_clears_page_progress(self):
+    def test_word_completion_marks_combo_and_keeps_page_progress(self):
         browser = self._browser_with_pages({1: [self._job()], 2: None})
         collected = []
+        checkpoints = []
         collector = ZhilianCollector(
             browser=browser, safety_conn=object(),
             sleep=lambda _s: None, uniform=lambda _a, _b: 10.0,
@@ -575,11 +626,10 @@ class ZhilianResumeCheckpointTests(TestCase):
             patch("bosshunter.collection.platforms.zhilian.should_take_day_off", return_value=False),
             patch("bosshunter.collection.platforms.zhilian.prune_collected_combos"),
             patch("bosshunter.collection.platforms.zhilian.prune_page_progress"),
-            patch("bosshunter.collection.platforms.zhilian.get_collected_combos", return_value=set()),
             patch("bosshunter.collection.platforms.zhilian.get_page_progress", return_value=0),
-            patch("bosshunter.collection.platforms.zhilian.upsert_page_progress"),
+            patch("bosshunter.collection.platforms.zhilian.upsert_page_progress",
+                  side_effect=lambda _c, _s, _ci, _k, page: checkpoints.append(page)),
             patch("bosshunter.collection.platforms.zhilian.mark_combo_collected") as mark_complete,
-            patch("bosshunter.collection.platforms.zhilian.delete_page_progress") as delete_progress,
         ):
             result = collector.collect(
                 PlatformCollectionRequest("zhilian", ["AI"], ["北京"], {"北京": "530"}, max_pages=2),
@@ -587,7 +637,8 @@ class ZhilianResumeCheckpointTests(TestCase):
             )
         self.assertEqual(result.status, "completed")
         mark_complete.assert_called_once()
-        delete_progress.assert_called_once()
+        # 页级断点在空页后推进到上限页，下次直接跳过本词
+        self.assertEqual(checkpoints, [1, 2])
 
     def test_blocked_page_does_not_mark_combo(self):
         browser = ZhilianBrowser(
@@ -609,11 +660,9 @@ class ZhilianResumeCheckpointTests(TestCase):
             patch("bosshunter.collection.platforms.zhilian.should_take_day_off", return_value=False),
             patch("bosshunter.collection.platforms.zhilian.prune_collected_combos"),
             patch("bosshunter.collection.platforms.zhilian.prune_page_progress"),
-            patch("bosshunter.collection.platforms.zhilian.get_collected_combos", return_value=set()),
             patch("bosshunter.collection.platforms.zhilian.get_page_progress", return_value=0),
             patch("bosshunter.collection.platforms.zhilian.upsert_page_progress"),
             patch("bosshunter.collection.platforms.zhilian.mark_combo_collected") as mark_complete,
-            patch("bosshunter.collection.platforms.zhilian.delete_page_progress"),
         ):
             result = collector.collect(
                 PlatformCollectionRequest("zhilian", ["AI"], ["北京"], {"北京": "530"}, max_pages=3),
@@ -635,22 +684,20 @@ class ZhilianResumeCheckpointTests(TestCase):
             patch("bosshunter.collection.platforms.zhilian.should_take_day_off", return_value=False),
             patch("bosshunter.collection.platforms.zhilian.prune_collected_combos"),
             patch("bosshunter.collection.platforms.zhilian.prune_page_progress"),
-            patch("bosshunter.collection.platforms.zhilian.get_collected_combos", return_value=set()),
             patch("bosshunter.collection.platforms.zhilian.get_page_progress", return_value=5),
             patch("bosshunter.collection.platforms.zhilian.upsert_page_progress"),
             patch("bosshunter.collection.platforms.zhilian.mark_combo_collected") as mark_complete,
-            patch("bosshunter.collection.platforms.zhilian.delete_page_progress") as delete_progress,
         ):
             result = collector.collect(
                 PlatformCollectionRequest("zhilian", ["AI"], ["北京"], {"北京": "530"}, max_pages=3),
                 self._hooks(collected, events),
             )
         self.assertEqual(result.status, "completed")
+        self.assertEqual(result.reason_code, "no_remaining_pages")
         self.assertEqual(len(collected), 0)
         mark_complete.assert_called_once()
-        delete_progress.assert_called_once()
         skip_events = [e for e in events if e.get("phase") == "completed_keyword"]
-        self.assertTrue(any("页级断点" in str(e.get("message", "")) for e in skip_events))
+        self.assertTrue(any("已采到最大页" in str(e.get("message", "")) for e in skip_events))
 
     def test_prune_called_on_collect_start(self):
         browser = self._browser_with_pages({1: [self._job()], 2: None})
@@ -663,11 +710,9 @@ class ZhilianResumeCheckpointTests(TestCase):
             patch("bosshunter.collection.platforms.zhilian.should_take_day_off", return_value=False),
             patch("bosshunter.collection.platforms.zhilian.prune_collected_combos") as prune_combos,
             patch("bosshunter.collection.platforms.zhilian.prune_page_progress") as prune_pages,
-            patch("bosshunter.collection.platforms.zhilian.get_collected_combos", return_value=set()),
             patch("bosshunter.collection.platforms.zhilian.get_page_progress", return_value=0),
             patch("bosshunter.collection.platforms.zhilian.upsert_page_progress"),
             patch("bosshunter.collection.platforms.zhilian.mark_combo_collected"),
-            patch("bosshunter.collection.platforms.zhilian.delete_page_progress"),
         ):
             collector.collect(
                 PlatformCollectionRequest("zhilian", ["AI"], ["北京"], {"北京": "530"}, max_pages=2),
@@ -675,6 +720,35 @@ class ZhilianResumeCheckpointTests(TestCase):
             )
         prune_combos.assert_called_once()
         prune_pages.assert_called_once()
+
+    def test_ignore_checkpoint_restarts_from_first_page(self):
+        job = {"source_job_id": "zl-1", "title": "AI", "company": "公司",
+               "city": "北京", "salary": "15-25K", "url": "/job/zl-1.html"}
+        browser = self._browser_with_pages({1: [job], 2: None})
+        collected = []
+        collector = ZhilianCollector(
+            browser=browser, safety_conn=object(),
+            sleep=lambda _s: None, uniform=lambda _a, _b: 10.0,
+        )
+        with (
+            patch("bosshunter.collection.platforms.zhilian.SendWindowChecker.is_active", return_value=True),
+            patch("bosshunter.collection.platforms.zhilian.should_take_day_off", return_value=False),
+            patch("bosshunter.collection.platforms.zhilian.prune_collected_combos"),
+            patch("bosshunter.collection.platforms.zhilian.prune_page_progress"),
+            patch("bosshunter.collection.platforms.zhilian.get_page_progress") as get_progress,
+            patch("bosshunter.collection.platforms.zhilian.upsert_page_progress"),
+            patch("bosshunter.collection.platforms.zhilian.mark_combo_collected"),
+        ):
+            result = collector.collect(
+                PlatformCollectionRequest(
+                    "zhilian", ["AI"], ["北京"], {"北京": "530"},
+                    max_pages=3, ignore_checkpoint=True,
+                ),
+                self._hooks(collected),
+            )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(len(collected), 1)
+        get_progress.assert_not_called()
 
     def test_resume_ttl_hours_from_config(self):
         collector = ZhilianCollector(
@@ -713,7 +787,6 @@ class ZhilianResumeCheckpointTests(TestCase):
             patch("bosshunter.collection.platforms.zhilian.SendWindowChecker.is_active", return_value=True),
             patch("bosshunter.collection.platforms.zhilian.should_take_day_off", return_value=False),
             patch("bosshunter.collection.platforms.zhilian.prune_collected_combos") as prune_combos,
-            patch("bosshunter.collection.platforms.zhilian.get_collected_combos") as get_combos,
             patch("bosshunter.collection.platforms.zhilian.get_page_progress") as get_progress,
             patch("bosshunter.collection.platforms.zhilian.upsert_page_progress") as upsert,
             patch("bosshunter.collection.platforms.zhilian.mark_combo_collected") as mark,
@@ -724,7 +797,6 @@ class ZhilianResumeCheckpointTests(TestCase):
             )
         self.assertEqual(result.status, "completed")
         prune_combos.assert_not_called()
-        get_combos.assert_not_called()
         get_progress.assert_not_called()
         upsert.assert_not_called()
         mark.assert_not_called()
@@ -1021,7 +1093,7 @@ class ZhilianCollectApiTests(TestCase):
         )
         collector = ZhilianCollector(browser=browser, sleep=lambda _s: None)
         request = PlatformCollectionRequest("zhilian", ["AI"], ["北京"], {"北京": "530"}, max_pages=1)
-        result = collector._collect_api(request, self._hooks([]), set())
+        result = collector._collect_api(request, self._hooks([]))
         self.assertIsNone(result)
 
     def test_api_success_collects_jobs(self):
@@ -1044,7 +1116,7 @@ class ZhilianCollectApiTests(TestCase):
             config={"profile": {"deal_breakers": [], "blocked_companies": []}},
         )
         request = PlatformCollectionRequest("zhilian", ["AI"], ["北京"], {"北京": "530"}, max_pages=1)
-        result = collector._collect_api(request, self._hooks(collected), set())
+        result = collector._collect_api(request, self._hooks(collected))
         self.assertIsNotNone(result)
         self.assertEqual(result.status, "completed")
         self.assertEqual(len(collected), 1)
@@ -1066,7 +1138,7 @@ class ZhilianCollectApiTests(TestCase):
         )
         collector = ZhilianCollector(browser=browser, sleep=lambda _s: None)
         request = PlatformCollectionRequest("zhilian", ["AI"], ["北京"], {"北京": "530"}, max_pages=1)
-        result = collector._collect_api(request, self._hooks([]), set())
+        result = collector._collect_api(request, self._hooks([]))
         self.assertIsNone(result)
 
     def test_api_hard_risk_raises_blocked(self):
@@ -1086,10 +1158,10 @@ class ZhilianCollectApiTests(TestCase):
         collector = ZhilianCollector(browser=browser, sleep=lambda _s: None)
         request = PlatformCollectionRequest("zhilian", ["AI"], ["北京"], {"北京": "530"}, max_pages=1)
         with self.assertRaises(CollectionBlockedError) as ctx:
-            collector._collect_api(request, self._hooks([]), set())
+            collector._collect_api(request, self._hooks([]))
         self.assertEqual(ctx.exception.code, "rate_limit")
 
-    def test_api_skips_collected_combos(self):
+    def test_api_skips_combination_without_remaining_pages(self):
         api_response = json.dumps({
             "http_status": 200,
             "content_type": "application/json",
@@ -1104,13 +1176,16 @@ class ZhilianCollectApiTests(TestCase):
             wait_for_load=lambda *a, **kw: True,
         )
         collected = []
-        collector = ZhilianCollector(browser=browser, sleep=lambda _s: None)
+        collector = ZhilianCollector(browser=browser, sleep=lambda _s: None, safety_conn=object())
         request = PlatformCollectionRequest("zhilian", ["AI"], ["北京"], {"北京": "530"}, max_pages=1)
-        result = collector._collect_api(
-            request, self._hooks(collected), {("北京", "AI")},
-        )
+        with (
+            patch("bosshunter.collection.platforms.zhilian.get_page_progress", return_value=1),
+            patch("bosshunter.collection.platforms.zhilian.mark_combo_collected"),
+        ):
+            result = collector._collect_api(request, self._hooks(collected))
         self.assertIsNotNone(result)
         self.assertEqual(result.status, "completed")
+        self.assertEqual(result.reason_code, "no_remaining_pages")
         self.assertEqual(len(collected), 0)
 
     def test_api_empty_page_ends_keyword(self):
@@ -1130,7 +1205,7 @@ class ZhilianCollectApiTests(TestCase):
         collected = []
         collector = ZhilianCollector(browser=browser, sleep=lambda _s: None)
         request = PlatformCollectionRequest("zhilian", ["AI"], ["北京"], {"北京": "530"}, max_pages=3)
-        result = collector._collect_api(request, self._hooks(collected), set())
+        result = collector._collect_api(request, self._hooks(collected))
         self.assertIsNotNone(result)
         self.assertEqual(result.status, "completed")
         self.assertEqual(len(collected), 0)

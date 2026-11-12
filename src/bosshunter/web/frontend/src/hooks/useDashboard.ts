@@ -11,6 +11,8 @@ interface ActivityData {
 }
 
 interface Job {
+  employment_type?: string
+  employment_review?: string
   id: string
   source_platform?: 'boss' | 'zhilian' | string
   source_job_id?: string | null
@@ -27,6 +29,12 @@ interface Job {
   score: number
   score_reason: string
   greeting: string
+  greeting_original?: string | null
+  greeting_optimized?: string | null
+  greeting_style_issues?: string[]
+  greeting_selection?: 'legacy' | 'generated' | 'pending' | 'auto_optimized' | 'original' | 'optimized' | 'edited' | string
+  greeting_activity?: 'generating' | 'sending' | 'editing' | null
+  greeting_reviewed_at?: string | null
   status: string
   hr_name: string
   hr_title: string
@@ -40,6 +48,10 @@ interface Job {
   deleted_reason?: string | null
   resume_path?: string
   last_error?: string
+  outsourcing_level?: 'clean' | 'suspected' | 'confirmed'
+  outsourcing_confirmed?: boolean
+  outsourcing_matches?: string[] | null
+  outsourcing_updated_at?: string | null
 }
 
 interface TopCompany {
@@ -50,7 +62,7 @@ interface TopCompany {
 
 export interface WorkbenchTask {
   id: string
-  mode: 'full' | 'collect' | 'rescore' | 'monitor' | 'deliver'
+  mode: 'full' | 'collect' | 'score' | 'rescore' | 'greet' | 'monitor' | 'deliver'
   label: string
   status: string
   logs: string[]
@@ -58,11 +70,13 @@ export interface WorkbenchTask {
   deadline_at?: string
   stop_reason?: string
   stop_requested: boolean
-  metrics?: Record<string, number>
-  progress?: CollectionProgress
+  metrics?: Record<string, number | string>
+  progress?: CollectionProgress & { conflict_ids?: string[] }
 }
 
 export interface CollectionPlatformProgress {
+  error_records?: { kind: 'parse' | 'save'; reason: string; title: string; company: string; city?: string; keyword?: string; page?: number }[]
+  filter_records?: { title: string; company: string; source_job_id: string; reason: string }[]
   status: string
   new: number
   target: number | null
@@ -72,6 +86,7 @@ export interface CollectionPlatformProgress {
   filtered?: number
   parse_failed?: number
   save_failed?: number
+  skipped?: number
   keyword?: string
   city?: string
   page?: number
@@ -79,9 +94,16 @@ export interface CollectionPlatformProgress {
   phase?: string
   reason_code?: string
   message?: string
+  city_elapsed_ms?: number
+  next_check_ms?: number
+  last_window_new?: number | null
+  city_new_total?: number
+  city_results?: Record<string, { status: string; new_total: number; reason_code?: string }>
 }
 
 export interface CollectionProgress {
+  session_id?: string
+  session?: { id?: string; phase: string; round: number; deadline_at: string; next_wake_at?: string | null; reason_code?: string; manual_pending_reason?: string; new?: number }
   run_id?: string
   outcome?: string
   current_platform?: string
@@ -155,40 +177,77 @@ export function useDashboard(scope: DashboardDataScope = 'all') {
   const [error, setError] = useState('')
   const [refreshing, setRefreshing] = useState(false)
   const [lastRefreshedAt, setLastRefreshedAt] = useState<Date | null>(null)
-  const refreshingRef = useRef(false)
+  const refreshControllerRef = useRef<AbortController | null>(null)
+  const greetingRevisionRef = useRef(0)
+
+  const updateGreetingJob = useCallback((updated: Job) => {
+    greetingRevisionRef.current += 1
+    setWorkbench(previous => ({
+      ...previous,
+      pending_confirmation: previous.pending_confirmation.map(job => job.id === updated.id ? updated : job),
+      pending_greetings: previous.pending_greetings.map(job => job.id === updated.id ? updated : job),
+      send_errors: previous.send_errors.map(job => job.id === updated.id ? updated : job),
+    }))
+  }, [])
 
   const fetchAll = useCallback(async () => {
-    if (refreshingRef.current) return
-    refreshingRef.current = true
+    if (refreshControllerRef.current) return
+    const controller = new AbortController()
+    refreshControllerRef.current = controller
+    const timeout = window.setTimeout(() => controller.abort(), 15000)
+    const greetingRevision = greetingRevisionRef.current
     setRefreshing(true)
     try {
       const needsWorkbench = scope === 'all' || scope === 'workbench'
       const needsHistory = scope === 'all' || scope === 'monitor'
-      const fetchOptions = { cache: 'no-store' as const }
+      const fetchOptions = { cache: 'no-store' as const, signal: controller.signal }
       const [workbenchRes, historyRes] = await Promise.all([
         needsWorkbench ? fetch('/api/workbench', fetchOptions) : Promise.resolve(null),
         needsHistory ? fetch('/api/history?limit=50&include_unresolved=1&include_monitor_conversations=1', fetchOptions) : Promise.resolve(null),
       ])
+      if ((workbenchRes && !workbenchRes.ok) || (historyRes && !historyRes.ok)) {
+        throw new Error('读取控制台数据失败')
+      }
       const [workbenchData, historyData] = await Promise.all([
         workbenchRes ? workbenchRes.json() : Promise.resolve(undefined),
         historyRes ? historyRes.json() : Promise.resolve(undefined),
       ])
 
-      if (workbenchData !== undefined) setWorkbench(workbenchData)
+      if (controller.signal.aborted || refreshControllerRef.current !== controller) return
+
+      // An older poll must not replace the greeting returned by a successful save.
+      if (workbenchData !== undefined && greetingRevision === greetingRevisionRef.current) setWorkbench(workbenchData)
       if (historyData !== undefined) setHistory(historyData)
       setLastRefreshedAt(new Date())
       setError('')
     } catch (err) {
+      if (refreshControllerRef.current !== controller) return
       console.error('Failed to fetch dashboard data:', err)
-      setError('无法读取本地控制台数据')
+      setError(controller.signal.aborted ? '进度刷新超时，将自动重试。' : '无法读取本地控制台数据，将自动重试。')
     } finally {
-      refreshingRef.current = false
-      setRefreshing(false)
-      setLoading(false)
+      window.clearTimeout(timeout)
+      if (refreshControllerRef.current === controller) {
+        refreshControllerRef.current = null
+        setRefreshing(false)
+        setLoading(false)
+      }
     }
   }, [scope])
 
-  const startTask = async (mode: 'full' | 'collect' | 'rescore' | 'monitor' | 'deliver', options?: Record<string, unknown>) => {
+  const updateJobStatus = useCallback(async (jobId: string, status: string) => {
+    const res = await fetch('/api/jobs/status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_ids: [jobId], status }),
+    })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.error || '修改岗位状态失败')
+    }
+    await fetchAll()
+  }, [fetchAll])
+
+  const startTask = async (mode: 'full' | 'collect' | 'score' | 'rescore' | 'greet' | 'monitor' | 'deliver', options?: Record<string, unknown>) => {
     const res = await fetch('/api/workbench/task', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -223,11 +282,15 @@ export function useDashboard(scope: DashboardDataScope = 'all') {
     const refreshWhenVisible = () => {
       if (document.visibilityState === 'visible') void fetchAll()
     }
-    const interval = window.setInterval(refreshWhenVisible, pollIntervalMs)
+    // Embedded browsers can report a hidden document even while its panel is open.
+    // Keep polling; browsers may throttle background timers, and focus also refreshes immediately.
+    const interval = window.setInterval(() => void fetchAll(), pollIntervalMs)
     window.addEventListener('focus', refreshWhenVisible)
     document.addEventListener('visibilitychange', refreshWhenVisible)
     return () => {
       window.clearInterval(interval)
+      refreshControllerRef.current?.abort()
+      refreshControllerRef.current = null
       window.removeEventListener('focus', refreshWhenVisible)
       document.removeEventListener('visibilitychange', refreshWhenVisible)
     }
@@ -241,6 +304,8 @@ export function useDashboard(scope: DashboardDataScope = 'all') {
     refreshing,
     lastRefreshedAt,
     refresh: fetchAll,
+    updateGreetingJob,
+    updateJobStatus,
     startTask,
     stopTask,
   }

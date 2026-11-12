@@ -7,9 +7,10 @@ import { Slider } from '@/components/ui/slider'
 import { TagsInput } from '@/components/ui/tags-input'
 import { CityMultiSelect, type CityOption } from '@/components/config/CityMultiSelect'
 import { ResumeUploadSection } from '@/components/config/ResumeUploadSection'
+import { SendWindowsInput, sendWindowsError } from '@/components/config/SendWindowsInput'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
-import { Save, RotateCcw, ChevronDown, ChevronRight } from 'lucide-react'
-import { useState, useEffect } from 'react'
+import { Save, RotateCcw, ChevronDown, ChevronRight, Loader2 } from 'lucide-react'
+import { useState, useEffect, useRef } from 'react'
 import { PLATFORM_LABELS, PLATFORM_SHORT_LABELS } from '@/lib/platforms'
 
 const AI_SERVICES = {
@@ -56,6 +57,8 @@ const BOSS_FILTER_OPTIONS = {
 
 export default function ConfigPage() {
   const { config, schema, loading, saving, dirty, error, message, updateConfig, saveConfig, resetConfig } = useConfig()
+  const windowError = config ? sendWindowsError(config.throttle?.send_windows ?? ['09:00-16:00']) : null
+  const collectionWindowError = config ? sendWindowsError(config.collection?.collect_windows ?? ['09:00-16:00'], '采集') : null
   const requestedSection = new URLSearchParams(window.location.search).get('section')
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>(() => ({
     profile: true,
@@ -63,12 +66,46 @@ export default function ConfigPage() {
     ...(requestedSection ? { [requestedSection]: true } : {}),
   }))
   const [aiTest, setAiTest] = useState<{ testing: boolean; ok?: boolean; message?: string }>({ testing: false })
+  const [modelList, setModelList] = useState<{ loading: boolean; models: string[]; message?: string; error?: boolean }>({ loading: false, models: [] })
+  const modelRequest = useRef<AbortController | null>(null)
   const [cityOptions, setCityOptions] = useState<CityOption[]>([])
   const [zhilianCityOptions, setZhilianCityOptions] = useState<CityOption[]>([])
   const [job51CityOptions, setJob51CityOptions] = useState<CityOption[]>([])
   const [liepinCityOptions, setLiepinCityOptions] = useState<CityOption[]>([])
   const [cityRefreshing, setCityRefreshing] = useState(false)
   const [cityMessage, setCityMessage] = useState('')
+
+  useEffect(() => {
+    setModelList({ loading: false, models: [] })
+    return () => modelRequest.current?.abort()
+  }, [config?.ai?.service, config?.ai?.provider, config?.ai?.base_url, config?.ai?.api_key, config?.ai?.api_key_masked, config?.ai?.auth_token_masked, config?.ai?.clear_credentials])
+
+  const handleFetchModels = async () => {
+    modelRequest.current?.abort()
+    const controller = new AbortController()
+    modelRequest.current = controller
+    setModelList({ loading: true, models: [] })
+    try {
+      const res = await fetch('/api/config/models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ai: config?.ai || {} }),
+        signal: controller.signal,
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || '获取模型列表失败')
+      if (!Array.isArray(data.models) || !data.models.every((model: unknown) => typeof model === 'string')) {
+        throw new Error('模型列表格式不正确，可手动填写模型 ID')
+      }
+      if (!controller.signal.aborted) setModelList({
+        loading: false,
+        models: data.models,
+        message: data.models.length ? `已获取 ${data.models.length} 个模型，请选择或继续手动填写。` : '服务商未返回可用模型，可手动填写模型 ID。',
+      })
+    } catch (error) {
+      if (!controller.signal.aborted) setModelList({ loading: false, models: [], error: true, message: error instanceof Error ? error.message : '获取模型列表失败，请重试' })
+    }
+  }
 
   useEffect(() => {
     fetch('/api/cities', { cache: 'no-store' })
@@ -227,12 +264,12 @@ export default function ConfigPage() {
   if (error || !config) {
     return (
       <div className="flex h-full items-center justify-center">
-        <div className="max-w-md rounded-2xl border border-card-border bg-[#FFFCFA] p-6 text-center">
+        <div className="max-w-md rounded-2xl border border-card-border bg-surface p-6 text-center">
           <div className="text-sm font-black text-foreground">配置加载失败</div>
           <p className="mt-2 text-xs leading-6 text-muted">
             请确认后端服务已启动：在项目根目录运行 bosshunter web，或启动 127.0.0.1:8686 后刷新页面。
           </p>
-          {error && <p className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-500">{error}</p>}
+          {error && <p className="mt-3 rounded-lg bg-danger-soft px-3 py-2 text-xs text-danger">{error}</p>}
           <Button className="mt-4" size="sm" onClick={resetConfig}>重试</Button>
         </div>
       </div>
@@ -248,32 +285,39 @@ export default function ConfigPage() {
   const bossTheoreticalPages = bossEstimateKeywords.length * bossEstimateCities.length * bossEstimateMaxPages
   const bossDailySearchLimit = Math.max(Number(config.collection?.daily_search_page_limit) || 60, 1)
   const bossTheoreticalExceedsLimit = bossTheoreticalPages > bossDailySearchLimit
+  const guidePlatform = (['boss', 'zhilian', '51job', 'liepin'] as PlatformId[])
+    .find(platform => config.platforms?.[platform]?.enabled ?? platform === 'boss')
 
   return (
     <div className="h-full overflow-y-auto space-y-4 pr-4">
         {/* Actions bar */}
         <div className="flex items-center justify-between sticky top-0 bg-background z-10 py-2">
           <div className="flex items-center gap-2">
-            {dirty && <span className="text-xs text-amber-400">有未保存的更改</span>}
+            {dirty && <span className="text-xs text-warning">有未保存的更改</span>}
             {message && (
-              <span className={`text-xs ${message.type === 'success' ? 'text-green-400' : 'text-red-400'}`}>
+              <span className={`text-xs ${message.type === 'success' ? 'text-success' : 'text-danger'}`}>
                 {message.text}
               </span>
             )}
           </div>
           <div className="flex items-center gap-2">
             <Button variant="ghost" size="sm" onClick={resetConfig}><RotateCcw className="w-3 h-3 mr-1" />重置</Button>
-            <Button size="sm" onClick={saveConfig} disabled={saving || !dirty}><Save className="w-3 h-3 mr-1" />{saving ? '保存中...' : '保存'}</Button>
+            <Button data-tour="config-save" size="sm" onClick={saveConfig} disabled={saving || !dirty || !!windowError || !!collectionWindowError}><Save className="w-3 h-3 mr-1" />{saving ? '保存中...' : '保存'}</Button>
           </div>
         </div>
+
+        {windowError && <p className="text-xs text-danger">发送时间窗口有误，请展开「反监测设置」修正后保存：{windowError}</p>}
+        {collectionWindowError && <p className="text-xs text-danger">采集时间窗口有误，请展开「反监测设置」修正后保存：{collectionWindowError}</p>}
 
         {/* Profile Section */}
         <SectionCard title="个人信息" sectionKey="profile" expanded={expandedSections} toggle={toggleSection}>
           <div className="space-y-4">
-            <ResumeUploadSection
-              currentResumePath={config.profile?.resume_path || ''}
-              updateConfig={updateConfig}
-            />
+            <div data-tour="resume-upload">
+              <ResumeUploadSection
+                currentResumePath={config.profile?.resume_path || ''}
+                updateConfig={updateConfig}
+              />
+            </div>
             <div className="grid grid-cols-2 gap-4">
               <Field label="最高学历">
                 <Select value={config.profile?.education || ''} onChange={e => updateConfig('profile.education', e.target.value)}>
@@ -294,17 +338,42 @@ export default function ConfigPage() {
                 </Select>
               </Field>
             </div>
-            <Field label="招呼语偏好">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <label className="text-xs text-foreground">AI 生成招呼语</label>
+                <p className="mt-1 text-xs text-muted">关闭后使用你填写的固定文案，发送仍需确认。</p>
+              </div>
+              <Switch
+                aria-label="AI 生成招呼语"
+                checked={config.profile?.ai_greeting_enabled ?? true}
+                onChange={value => updateConfig('profile.ai_greeting_enabled', value)}
+              />
+            </div>
+            {(config.profile?.ai_greeting_enabled ?? true) === false && (
+              <Field label="固定招呼语">
+                <textarea
+                  aria-label="固定招呼语"
+                  value={config.profile?.fixed_greeting || ''}
+                  onChange={e => updateConfig('profile.fixed_greeting', e.target.value)}
+                  placeholder="填写你希望使用的招呼语"
+                  rows={3}
+                  maxLength={300}
+                  className="w-full resize-y rounded-md border border-card-border bg-surface px-3 py-2 text-sm text-foreground outline-none focus:border-primary"
+                />
+                <p className="mt-1 text-xs text-muted">保存后，新生成时原样使用，不调用 AI。已有文案保留，可逐条编辑。</p>
+              </Field>
+            )}
+            {(config.profile?.ai_greeting_enabled ?? true) && <Field label="招呼语偏好">
               <textarea
                 value={config.profile?.greeting_preference || ''}
                 onChange={e => updateConfig('profile.greeting_preference', e.target.value)}
                 placeholder="例如：语气简洁；不要主动询问薪资；不要提能否出差"
                 rows={3}
                 maxLength={500}
-                className="w-full resize-y rounded-md border border-card-border bg-[#FFFCFA] px-3 py-2 text-sm text-foreground outline-none placeholder:text-muted focus:border-primary"
+                className="w-full resize-y rounded-md border border-card-border bg-surface px-3 py-2 text-sm text-foreground outline-none placeholder:text-muted focus:border-primary"
               />
               <p className="mt-1 text-xs text-muted">仅补充语气和内容偏好，不能覆盖真实简历与安全规则。</p>
-            </Field>
+            </Field>}
             <NumberRangeField
               label="期望薪资范围（K）"
               minValue={config.profile?.salary_min ?? 0}
@@ -324,12 +393,12 @@ export default function ConfigPage() {
               />
               <p className="mt-1 text-xs text-muted">按岗位薪资区间下限判断；下限超过最高薪资 × 放宽倍数时会在 AI 评分前跳过。</p>
             </Field>
-            <div className="flex items-center justify-between rounded-xl border border-card-border bg-[#FFFCFA] px-3 py-2">
+            <div className="flex items-center justify-between rounded-xl border border-card-border bg-surface px-3 py-2">
               <div>
                 <label className="text-xs text-foreground">过滤面议/无法解析薪资</label>
-                <p className="mt-1 text-xs text-muted">关闭后这类岗位会保留给 AI 综合判断。</p>
+                <p className="mt-1 text-xs text-muted">{config.profile?.allow_internship ? '已接受实习，自动关闭此过滤，避免日薪岗位被误排除。' : '关闭后这类岗位会保留给 AI 综合判断。'}</p>
               </div>
-              <Switch checked={config.profile?.filter_unparsed_salary ?? true} onChange={v => updateConfig('profile.filter_unparsed_salary', v)} />
+              <Switch aria-label="过滤面议/无法解析薪资" checked={config.profile?.allow_internship ? false : (config.profile?.filter_unparsed_salary ?? true)} disabled={config.profile?.allow_internship === true} onChange={v => updateConfig('profile.filter_unparsed_salary', v)} />
             </div>
             <Field label="排除关键词">
               <TagsInput value={config.profile?.deal_breakers || []} onChange={v => updateConfig('profile.deal_breakers', v)} placeholder="如：外包、996" />
@@ -343,8 +412,11 @@ export default function ConfigPage() {
               <p className="mt-1 text-xs text-muted">公司名包含这些词时不采集，也不会进入 AI 评分。</p>
             </Field>
             <div className="flex items-center justify-between">
-              <label className="text-xs text-foreground">接受实习/管培岗位</label>
-              <Switch checked={config.profile?.allow_internship ?? false} onChange={v => updateConfig('profile.allow_internship', v)} />
+              <label className="text-xs text-foreground">接受实习岗位</label>
+              <Switch aria-label="接受实习岗位" checked={config.profile?.allow_internship ?? false} onChange={v => {
+                updateConfig('profile.allow_internship', v)
+                if (v) updateConfig('profile.filter_unparsed_salary', false)
+              }} />
             </div>
           </div>
         </SectionCard>
@@ -352,7 +424,7 @@ export default function ConfigPage() {
         {/* Search Section */}
         <SectionCard title="搜索设置" sectionKey="search" expanded={expandedSections} toggle={toggleSection}>
           <div className="space-y-4">
-            <p className="rounded-xl border border-card-border bg-[#FFFCFA] px-3 py-2 text-xs leading-5 text-muted">
+            <p className="rounded-xl border border-card-border bg-surface px-3 py-2 text-xs leading-5 text-muted">
               智联、前程无忧和猎聘只自动采集、评分和生成招呼语；岗位池会提供原平台链接，你完成投递后可手动标记“已发送”。BossHunter 不会替你在这些平台发送、回复或监听。
             </p>
             {(['boss', 'zhilian', '51job', 'liepin'] as PlatformId[]).map(platform => {
@@ -366,8 +438,8 @@ export default function ConfigPage() {
               const cityInput = cities.join(', ')
               const bossFilters = search.filters && typeof search.filters === 'object' ? search.filters : {}
               return (
-                <div key={platform} className={`rounded-2xl border p-4 ${enabled ? 'border-primary/30 bg-[#FFFCFA]' : 'border-card-border bg-white opacity-70'}`}>
-                  <div className="flex items-center justify-between gap-3">
+                <div key={platform} data-tour={!guidePlatform && platform === 'boss' ? 'search-city' : undefined} className={`rounded-2xl border p-4 ${enabled ? 'border-primary/30 bg-surface' : 'border-card-border bg-card opacity-70'}`}>
+                  <div data-tour={!guidePlatform && platform === 'boss' ? 'search-keywords' : undefined} className="flex items-center justify-between gap-3">
                     <label className="flex items-center gap-2 text-sm font-black text-foreground">
                       <input type="checkbox" checked={enabled} onChange={event => setPlatformEnabled(platform, event.target.checked)} className="h-4 w-4 accent-primary" />
                       {label}
@@ -375,11 +447,12 @@ export default function ConfigPage() {
                     <span className="text-xs text-muted">{enabled ? '已启用' : '未启用'}</span>
                   </div>
                   {enabled && <div className="mt-4 space-y-3">
-                    <Field label="搜索关键词" hint={platform === 'boss' ? '输入岗位后请按回车键确认，多岗位用","隔开，否则配置无法保存。' : undefined}>
+                    <Field label="搜索关键词" dataTour={platform === guidePlatform ? 'search-keywords' : undefined} hint={platform === 'boss' ? '输入岗位后请按回车键确认，多岗位用","隔开，否则配置无法保存。' : undefined}>
                       <TagsInput value={Array.isArray(search.keywords) ? search.keywords : []} onChange={value => updatePlatformSearch(platform, 'keywords', value)} placeholder="如：人力、产品运营" />
                     </Field>
-                    <Field label="搜索城市">
+                    <Field label="搜索城市" dataTour={platform === guidePlatform && platform !== 'boss' ? 'search-city' : undefined}>
                       {platform === 'boss' ? <CityMultiSelect
+                        tourTarget={platform === guidePlatform ? 'search-city' : undefined}
                         options={cityOptions}
                         value={cities}
                         onChange={value => updatePlatformCities(platform, value)}
@@ -392,7 +465,7 @@ export default function ConfigPage() {
                         <p className="mt-1 text-xs text-muted">{PLATFORM_SHORT_LABELS[platform]}只使用已验证的城市编码；当前内置 {platformCityOptions.length} 个城市。</p>
                         {!!cities.length && <div className="mt-2 flex flex-wrap gap-1">{cities.map((city: string) => {
                           const matched = platformCityOptions.find(option => option.name.replace(/市$/, '') === city.replace(/市$/, ''))
-                          return <span key={city} className={`rounded-full px-2 py-1 text-xs ${matched ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'}`}>{city} · {matched ? '已自动识别' : '暂未收录'}</span>
+                          return <span key={city} className={`rounded-full px-2 py-1 text-xs ${matched ? 'bg-success-soft text-success' : 'bg-warning-soft text-warning'}`}>{city} · {matched ? '已自动识别' : '暂未收录'}</span>
                         })}</div>}
                       </>}
                     </Field>
@@ -400,7 +473,7 @@ export default function ConfigPage() {
                       <Field label="最大页数">
                         <Input type="number" value={search.max_pages || (platform === 'boss' ? 3 : 1)} onChange={event => updatePlatformSearch(platform, 'max_pages', Number(event.target.value))} min={1} max={10} />
                         {platform === 'boss' && bossTheoreticalPages > 0 && (
-                          <p className={`mt-1 rounded-lg px-3 py-2 text-xs ${bossTheoreticalExceedsLimit ? 'bg-amber-50 font-bold text-amber-700' : 'bg-emerald-50 text-emerald-700'}`}>
+                          <p className={`mt-1 rounded-lg px-3 py-2 text-xs ${bossTheoreticalExceedsLimit ? 'bg-warning-soft font-bold text-warning' : 'bg-success-soft text-success'}`}>
                             理论最多 {bossTheoreticalPages} 页（{bossEstimateKeywords.length} 个关键词 × {bossEstimateCities.length} 个城市 × {bossEstimateMaxPages} 页）。
                             {bossTheoreticalExceedsLimit
                               ? ` 已超过每日 ${bossDailySearchLimit} 页上限，到达上限后会提示并停止 BOSS 当前轮。`
@@ -414,8 +487,16 @@ export default function ConfigPage() {
                           {platform !== '51job' && <option value="newest">最新</option>}
                         </Select>
                       </Field>
+                      {platform !== 'boss' && <Field label="断点有效期（小时）">
+                        <Input type="number" value={search.resume_ttl_hours ?? 24} onChange={event => updatePlatformSearch(platform, 'resume_ttl_hours', Number(event.target.value))} min={1} max={720} />
+                        <p className="mt-1 text-xs text-muted">有效期内接着上次采到的页码继续；超过有效期后从第 1 页重扫。</p>
+                      </Field>}
                     </div>
-                    {platform === 'boss' && <div className="space-y-3 rounded-xl border border-card-border bg-white p-3">
+                    {platform === 'boss' && <div className="space-y-3 border-t border-card-border pt-3">
+                      <label className="flex items-center justify-between text-sm font-bold">城市低产切换<Switch checked={search.city_yield_policy?.enabled ?? true} onChange={enabled => updatePlatformSearch('boss', 'city_yield_policy', { warmup_minutes: 10, window_minutes: 5, min_new_jobs: 5, ...search.city_yield_policy, enabled })} /></label>
+                      <div className="grid gap-3 sm:grid-cols-3">{([{ key: 'warmup_minutes', label: '首次检查（分钟）', initial: 10, max: 60 }, { key: 'window_minutes', label: '检查间隔（分钟）', initial: 5, max: 30 }, { key: 'min_new_jobs', label: '窗口最低新增', initial: 5, max: 1000 }]).map(field => <Field key={field.key} label={field.label}><Input type="number" min={1} max={field.max} value={search.city_yield_policy?.[field.key] ?? field.initial} onChange={event => updatePlatformSearch('boss', 'city_yield_policy', { enabled: true, warmup_minutes: 10, window_minutes: 5, min_new_jobs: 5, ...search.city_yield_policy, [field.key]: Number(event.target.value) })} /></Field>)}</div>
+                    </div>}
+                    {platform === 'boss' && <div className="space-y-3 rounded-xl border border-card-border bg-card p-3">
                       <p className="text-xs font-black text-foreground">BOSS 搜索筛选（可选）</p>
                       <div className="grid gap-3 md:grid-cols-2">
                         <Field label="职位类型">
@@ -440,7 +521,7 @@ export default function ConfigPage() {
                               key={option}
                               type="button"
                               onClick={() => updateBossFilter(search, key, option)}
-                              className={`rounded-full border px-2.5 py-1 text-xs font-bold ${selected.includes(option) ? 'border-primary bg-[#FFF0E5] text-primary' : 'border-card-border bg-white text-muted hover:border-primary/40'}`}
+                              className={`rounded-full border px-2.5 py-1 text-xs font-bold ${selected.includes(option) ? 'border-primary bg-secondary text-primary' : 'border-card-border bg-card text-muted hover:border-primary/40'}`}
                             >{option}</button>)}
                           </div>
                         </Field>
@@ -471,7 +552,7 @@ export default function ConfigPage() {
                   <option value="boss,zhilian,51job,liepin">BOSS → 智联 → 前程无忧 → 猎聘</option>
                 </Select>
               </Field>
-              <div className="flex items-center justify-between rounded-xl border border-card-border bg-[#FFFCFA] px-3 py-2 text-xs font-bold text-muted">
+              <div className="flex items-center justify-between rounded-xl border border-card-border bg-surface px-3 py-2 text-xs font-bold text-muted">
                 采集后自动评分
                 <Switch checked={config.collection?.auto_score_default ?? false} onChange={value => updateConfig('collection.auto_score_default', value)} />
               </div>
@@ -494,7 +575,7 @@ export default function ConfigPage() {
         {/* AI Section */}
         <SectionCard title="AI 设置" sectionKey="ai" expanded={expandedSections} toggle={toggleSection}>
           <div className="space-y-4">
-            <Field label="提供商">
+            <Field label="提供商" dataTour="ai-fields">
               <Select
                 value={config.ai?.service || (config.ai?.provider === 'openai_compatible' ? 'custom' : 'anthropic')}
                 onChange={e => handleAiServiceChange(e.target.value as AiService)}
@@ -510,10 +591,28 @@ export default function ConfigPage() {
               </p>
             </Field>
             <Field label="模型名称">
-              <Input value={config.ai?.model || ''} onChange={e => {
-                updateConfig('ai.model', e.target.value)
-                setAiTest({ testing: false })
-              }} placeholder="填写服务商当前支持的模型 ID" />
+              <div className="flex flex-wrap gap-2">
+                <Input aria-label="模型名称" className="min-w-0 flex-1 basis-40" value={config.ai?.model || ''} onChange={e => {
+                  updateConfig('ai.model', e.target.value)
+                  setAiTest({ testing: false })
+                }} placeholder="填写服务商当前支持的模型 ID" />
+                <Button type="button" variant="secondary" disabled={modelList.loading} onClick={handleFetchModels}>
+                  {modelList.loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />}
+                  {modelList.loading ? '获取中…' : '获取模型列表'}
+                </Button>
+              </div>
+              {modelList.models.length > 0 && (
+                <Select aria-label="可用模型" className="mt-2 pr-8 appearance-auto" value={modelList.models.includes(config.ai?.model) ? config.ai.model : ''} onChange={e => {
+                  updateConfig('ai.model', e.target.value)
+                  setAiTest({ testing: false })
+                }}>
+                  <option value="" disabled>请选择模型</option>
+                  {modelList.models.map(model => <option key={model} value={model}>{model}</option>)}
+                </Select>
+              )}
+              <p role="status" className={`mt-1 text-xs ${modelList.error ? 'text-danger' : 'text-muted'}`}>
+                {modelList.message || '按当前 Base URL 和 API Key 获取，无需先保存配置。'}
+              </p>
             </Field>
             <Field label="API Key">
               <Input type="password" value={config.ai?.api_key || ''} onChange={e => {
@@ -571,14 +670,27 @@ export default function ConfigPage() {
               </Select>
               <p className="mt-1 text-xs text-muted">默认 1；提高并发会增加 API 限流风险。</p>
             </Field>
-            <div className="flex items-center justify-between rounded-lg border border-card-border bg-[#FFFCFA] p-3">
+            <div className="flex items-center justify-between rounded-lg border border-card-border bg-surface p-3">
               <div>
                 <label className="text-xs font-bold text-foreground">临界评分二次复核</label>
                 <p className="mt-1 text-xs text-muted">默认关闭；开启后会增加 AI 调用次数。</p>
               </div>
               <Switch checked={config.ai?.scoring_second_review ?? false} onChange={v => updateConfig('ai.scoring_second_review', v)} />
             </div>
-            <div className="rounded-2xl border border-card-border bg-[#FFFCFA] p-3">
+            {(config.profile?.ai_greeting_enabled ?? true) && <div className="rounded-2xl border border-primary/20 bg-surface-muted p-4">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <label className="text-sm font-black text-foreground">招呼语质量提醒</label>
+                  <p className="mt-1 text-xs leading-5 text-muted">可选检查一次，只提供建议，不拒绝或自动改写文案。默认关闭。</p>
+                </div>
+                <Switch
+                  aria-label="招呼语质量提醒"
+                  checked={config.ai?.greeting_style_suggestions ?? false}
+                  onChange={value => updateConfig('ai.greeting_style_suggestions', value)}
+                />
+              </div>
+            </div>}
+            <div className="rounded-2xl border border-card-border bg-surface p-3">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <div className="text-sm font-black text-foreground">AI 连接检测</div>
@@ -590,7 +702,7 @@ export default function ConfigPage() {
               </div>
               {aiTest.message && (
                 <p className={`mt-2 rounded-lg px-3 py-2 text-xs ${
-                  aiTest.ok ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-500'
+                  aiTest.ok ? 'bg-success-soft text-success' : 'bg-danger-soft text-danger'
                 }`}>
                   {aiTest.message}
                 </p>
@@ -606,13 +718,14 @@ export default function ConfigPage() {
               <Field label="BOSS 单日搜索页上限">
                 <Input type="number" value={config.collection?.daily_search_page_limit ?? 60} onChange={e => updateConfig('collection.daily_search_page_limit', Number(e.target.value))} min={1} max={200} />
                 {bossTheoreticalPages > 0 && (
-                  <p className={`mt-1 text-xs ${bossTheoreticalExceedsLimit ? 'font-bold text-amber-700' : 'text-muted'}`}>
+                  <p className={`mt-1 text-xs ${bossTheoreticalExceedsLimit ? 'font-bold text-warning' : 'text-muted'}`}>
                     当前搜索组合理论最多 {bossTheoreticalPages} 页；{bossTheoreticalExceedsLimit ? `超过本上限 ${bossDailySearchLimit} 页，会在设置处和执行时提示。` : '未超过本上限。'}
                   </p>
                 )}
               </Field>
               <Field label="BOSS 单日详情页尝试上限">
-                <Input type="number" value={config.collection?.daily_detail_page_limit ?? 150} onChange={e => updateConfig('collection.daily_detail_page_limit', Number(e.target.value))} min={1} max={500} />
+                <Input type="number" value={config.collection?.daily_detail_page_limit ?? 900} onChange={e => updateConfig('collection.daily_detail_page_limit', Number(e.target.value))} min={1} max={1000} />
+                <p className="mt-1 text-xs text-muted">只计算打开岗位详情的尝试；列表中跳过的重复、过滤岗位不占用详情额度。详情访问也计入下方总上限。</p>
               </Field>
               <Field label="BOSS 连续页面失败停止阈值">
                 <Input type="number" value={config.collection?.max_consecutive_page_failures ?? 3} onChange={e => updateConfig('collection.max_consecutive_page_failures', Number(e.target.value))} min={1} max={10} />
@@ -642,8 +755,8 @@ export default function ConfigPage() {
             </div>
             <p className="text-xs text-muted">完成 BOSS 采集后，每次会在设定区间内随机等待一次再投递；默认为 5–15 分钟，单独采集不受影响。</p>
             <Field label="BOSS 单日页面访问总上限">
-              <Input type="number" value={config.safety?.daily_platform_page_limit ?? 500} onChange={e => updateConfig('safety.daily_platform_page_limit', Number(e.target.value))} min={1} max={2000} />
-              <p className="mt-1 text-xs text-muted">只合计 BOSS 采集、自动投递和监测打开的页面；智联和 51job 不占用。</p>
+              <Input type="number" value={config.safety?.daily_platform_page_limit ?? 1100} onChange={e => updateConfig('safety.daily_platform_page_limit', Number(e.target.value))} min={1} max={2000} />
+              <p className="mt-1 text-xs text-muted">合计 BOSS 搜索页、详情页、自动投递和监测打开的页面；默认 1100 次，可容纳 60 次搜索与 900 次详情，另余 140 次供其他操作使用。其他平台不占用。</p>
             </Field>
             <div className="grid gap-4 md:grid-cols-2">
               <Field label="每日发送上限">
@@ -660,7 +773,7 @@ export default function ConfigPage() {
               />
             </div>
             <div className="grid items-end gap-4 md:grid-cols-2">
-              <div className="flex h-9 items-center justify-between rounded-md border border-card-border bg-[#FFFCFA] px-3">
+              <div className="flex h-9 items-center justify-between rounded-md border border-card-border bg-surface px-3">
                 <label className="text-xs text-foreground">发送前模拟浏览</label>
                 <Switch checked={config.throttle?.browse_before_greet ?? true} onChange={v => updateConfig('throttle.browse_before_greet', v)} />
               </div>
@@ -677,11 +790,15 @@ export default function ConfigPage() {
             </div>
             <div className="grid gap-4 md:grid-cols-2">
               <Field label="发送时间窗口">
-                <TagsInput value={config.throttle?.send_windows || ['09:00-16:00']} onChange={v => updateConfig('throttle.send_windows', v)} placeholder="HH:MM-HH:MM" />
-                <p className="mt-1 text-xs text-muted">当天最后一个窗口结束时自动停止。</p>
+                <SendWindowsInput value={config.throttle?.send_windows ?? ['09:00-16:00']} onChange={v => updateConfig('throttle.send_windows', v)} />
+                <p className="mt-1 text-xs text-muted">仅约束发送、监测与后台任务截止；当天最后一个窗口结束时自动停止。</p>
               </Field>
               <Field label="随机休息概率">
                 <Input type="number" value={config.throttle?.day_off_probability || 0.05} onChange={e => updateConfig('throttle.day_off_probability', Number(e.target.value))} step={0.01} min={0} max={1} />
+              </Field>
+              <Field label="采集时间窗口">
+                <SendWindowsInput label="采集" idPrefix="采集时间段" addButtonLabel="添加采集时间段" value={config.collection?.collect_windows ?? ['09:00-16:00']} onChange={v => updateConfig('collection.collect_windows', v)} />
+                <p className="mt-1 text-xs text-muted">约束四个平台的单次采集；持续采集会话沿用自身截止，不受此处限制。</p>
               </Field>
             </div>
           </div>
@@ -710,7 +827,7 @@ export default function ConfigPage() {
             <Field label="每轮最多发简历数">
               <Input type="number" value={config.monitor?.max_resume_sends_per_cycle || 5} onChange={e => updateConfig('monitor.max_resume_sends_per_cycle', Number(e.target.value))} min={1} />
             </Field>
-            <div className="flex items-center justify-between rounded-2xl border border-card-border bg-[#FFFCFA] p-4">
+            <div className="flex items-center justify-between rounded-2xl border border-card-border bg-surface p-4">
               <div>
                 <label className="text-sm font-black text-foreground">检测到 HR 问题时自动回复</label>
                 <p className="mt-1 text-xs text-muted">默认关闭。关闭时只生成回复建议，需要你在“监测执行”中确认后发送。</p>
@@ -737,14 +854,6 @@ export default function ConfigPage() {
           </div>
         </SectionCard>
 
-        {/* Dedup Section */}
-        <SectionCard title="去重设置" sectionKey="dedup" expanded={expandedSections} toggle={toggleSection}>
-          <div className="space-y-4">
-            <Field label="历史记录文件路径">
-              <Input value={config.dedup?.history_file || ''} onChange={e => updateConfig('dedup.history_file', e.target.value)} />
-            </Field>
-          </div>
-        </SectionCard>
     </div>
   )
 }
@@ -757,7 +866,8 @@ function SectionCard({ title, sectionKey, expanded, toggle, children }: {
   return (
     <Card>
       <button
-        className="w-full flex items-center justify-between p-4 transition-colors hover:bg-[#FFFCFA]"
+        data-tour={sectionKey === 'ai' ? 'ai-section' : undefined}
+        className="w-full flex items-center justify-between p-4 transition-colors hover:bg-surface"
         onClick={() => toggle(sectionKey)}
       >
         <span className="text-sm font-black text-foreground">{title}</span>
@@ -768,9 +878,9 @@ function SectionCard({ title, sectionKey, expanded, toggle, children }: {
   )
 }
 
-function Field({ label, children, hint }: { label: string; children: React.ReactNode; hint?: string }) {
+function Field({ label, children, hint, dataTour }: { label: string; children: React.ReactNode; hint?: string; dataTour?: string }) {
   return (
-    <div>
+    <div data-tour={dataTour}>
       <div className="mb-1.5 flex items-baseline justify-between gap-2">
         <label className="block text-xs text-foreground">{label}</label>
         {hint && <span className="text-[11px] leading-4 text-muted">{hint}</span>}
@@ -805,7 +915,7 @@ function NumberRangeField({
 
   return (
     <Field label={label}>
-      <div className="flex h-9 items-center overflow-hidden rounded-md border border-card-border bg-white focus-within:border-primary focus-within:ring-2 focus-within:ring-primary/30">
+      <div className="flex h-9 items-center overflow-hidden rounded-md border border-card-border bg-card focus-within:border-primary focus-within:ring-2 focus-within:ring-primary/30">
         <span className="shrink-0 pl-3 text-[11px] text-muted">最少</span>
         <input
           aria-label={`${label}最少`}
@@ -818,7 +928,7 @@ function NumberRangeField({
           step={step}
           disabled={disabled}
         />
-        <span className="flex h-full shrink-0 items-center border-x border-card-border bg-[#FFFCFA] px-3 text-xs font-bold text-muted">至</span>
+        <span className="flex h-full shrink-0 items-center border-x border-card-border bg-surface px-3 text-xs font-bold text-muted">至</span>
         <span className="shrink-0 pl-3 text-[11px] text-muted">最多</span>
         <input
           aria-label={`${label}最多`}

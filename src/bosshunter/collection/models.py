@@ -15,7 +15,7 @@ PlatformId = Literal["boss", "zhilian", "51job", "liepin"]
 def classify_recruitment_type(title: str = "", experience: str = "", jd: str = "") -> str:
     """Classify explicit campus/social recruitment signals conservatively."""
     text = " ".join(str(value or "") for value in (title, experience, jd))
-    if any(marker in text for marker in ("校招", "校园招聘", "应届", "毕业生", "管培生", "实习生")):
+    if any(marker in text for marker in ("校招", "校园招聘", "应届", "毕业生", "管培生")):
         return "campus"
     if any(marker in text for marker in ("社招", "社会招聘")):
         return "experienced"
@@ -35,6 +35,10 @@ class PlatformCollectionRequest:
     max_pages: int = 3
     sort: str = "default"
     filters: dict[str, Any] = field(default_factory=dict)
+    # 重新采集：忽略上次页码，从第 1 页开始。
+    ignore_checkpoint: bool = False
+    city_yield_policy: dict[str, Any] | None = None
+    keyword_start: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -108,12 +112,19 @@ class CollectionProgress:
     filtered: int = 0
     parse_failed: int = 0
     save_failed: int = 0
+    skipped: int = 0
     keyword: str = ""
     city: str = ""
     page: int = 0
     max_pages: int = 0
     reason_code: str = ""
     message: str = ""
+
+    city_elapsed_ms: int = 0
+    next_check_ms: int = 0
+    last_window_new: int | None = None
+    city_new_total: int = 0
+    city_results: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -134,3 +145,4 @@ class PlatformCollectionResult:
     new_job_ids: list[str] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=dict)
     error: str = ""
+    city_results: dict[str, Any] = field(default_factory=dict)

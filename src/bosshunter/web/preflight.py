@@ -13,6 +13,8 @@ import httpx
 
 from bosshunter import __version__
 from bosshunter.ai.credentials import (
+	AIRequestError,
+	call_anthropic_text,
 	get_ai_api_key,
 	get_ai_base_url,
 	get_ai_base_url_source,
@@ -36,6 +38,7 @@ def collect_preflight_checks(mode: str, config: dict, options: dict | None = Non
 			checks = [_check("collection_options", "采集参数", "error", str(exc), "请在岗位采集窗口修正平台、关键词、城市或目标数量。", "config")]
 		else:
 			checks = _configuration_checks(mode, config, collection_options)
+			checks.extend(_collection_city_checks(collection_options))
 	else:
 		checks = _configuration_checks(mode, config, options)
 	if mode not in VALID_MODES:
@@ -90,6 +93,7 @@ def collect_preflight_checks(mode: str, config: dict, options: dict | None = Non
 				)
 			)
 		else:
+			checks.extend(_collection_city_checks(full_options))
 			checks.append(
 				_check(
 					"full_flow_platform",
@@ -100,6 +104,17 @@ def collect_preflight_checks(mode: str, config: dict, options: dict | None = Non
 				)
 			)
 	return checks
+
+
+def _collection_city_checks(options: dict) -> list[dict[str, str]]:
+	boss = options.get("platforms", {}).get("boss", {})
+	unresolved = [city for city in boss.get("cities", []) if not boss.get("city_codes", {}).get(city)]
+	if not unresolved:
+		return []
+	return [_check(
+		"boss_cities", "BOSS 搜索地区", "warning", f"将跳过未识别地区：{'、'.join(unresolved)}",
+		"其他有效城市继续采集；原配置保留。省份不会自动替换成省会；如需该地区，请填写具体城市或提供已确认的 BOSS 地区编码。", "config",
+	)]
 
 
 def check_ai_connection(config: dict, required: bool = True) -> list[dict[str, str]]:
@@ -236,13 +251,16 @@ def _check_ai_connection(config: dict, required: bool) -> list[dict[str, str]]:
 			)
 		]
 	if result.status_code in {404, 405}:
+		probe_failure = _probe_model_generation(config, model, severity, [])
+		if probe_failure is not None:
+			return [probe_failure]
 		return [
 			_check(
 				"ai_connection",
 				"AI 接口连接",
-				"warning",
-				"接口可访问，但无法自动验证模型",
-				"该兼容服务未提供模型列表接口；BossHunter 启动时仍会尝试消息接口。",
+				"pass",
+				"AI 接口连接正常",
+				f"该兼容服务未提供模型列表接口，已改用最小生成请求验证模型 {model} 可调用。",
 				"config",
 			)
 		]
@@ -269,15 +287,90 @@ def _check_ai_connection(config: dict, required: bool) -> list[dict[str, str]]:
 			)
 		]
 
+	probe_failure = _probe_model_generation(config, model, severity, _available_model_ids(result))
+	if probe_failure is not None:
+		return [probe_failure]
+
 	return [
 		_check(
 			"ai_connection",
 			"AI 接口连接",
 			"pass",
 			"AI 接口连接正常",
-			f"已验证凭证和服务地址，当前模型：{model}；Key 来源：{key_source or '未知'}；Base URL 来源：{base_url_source or '官方默认'}。",
+			f"已验证凭证和服务地址，当前模型：{model}；Key 来源：{key_source or '未知'}；Base URL 来源：{base_url_source or '官方默认'}。"
+			"本次已发送一条最小生成请求，确认该模型可实际调用。",
 		)
 	]
+
+
+def _available_model_ids(response: object) -> list[str]:
+	"""Extract model IDs from a model-list response without trusting its shape."""
+	try:
+		payload = response.json()
+	except Exception:
+		return []
+	if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+		return []
+	return [
+		item["id"].strip()
+		for item in payload["data"]
+		if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip()
+	]
+
+
+def _probe_model_generation(
+	config: dict,
+	model: str,
+	severity: str,
+	available: list[str],
+) -> dict[str, str] | None:
+	"""Send one tiny generation request: a listed model can still be unroutable (404)."""
+	alternatives = [item for item in available if item != model]
+	hint = f"模型列表中的其他模型：{'、'.join(alternatives[:8])}。" if alternatives else ""
+	try:
+		text = call_anthropic_text("只回复 OK", config, 64, timeout=30, purpose="scoring")
+	except AIRequestError as exc:
+		# output_limit/context_limit 在评分流程里有自愈重试，不应据此判定模型不可用。
+		if exc.kind == "model_not_found" or (
+			exc.status_code in {400, 404, 422}
+			and exc.kind not in {"output_limit", "context_limit"}
+		):
+			return _check(
+				"ai_model",
+				"AI 模型",
+				severity,
+				f"模型 {model} 无法正常调用",
+				f"{exc}。{hint}请在“配置 → AI 设置”中改用可调用的模型后重新检测。",
+				"config",
+			)
+		return _check(
+			"ai_connection",
+			"AI 接口连接",
+			"warning",
+			"AI 生成请求未通过",
+			f"{exc}。{hint}模型列表可访问，但生成请求失败，评分任务可能中断。",
+			"config",
+		)
+	except Exception:
+		# Never surface raw provider payloads here: they may echo request data.
+		return _check(
+			"ai_connection",
+			"AI 接口连接",
+			"warning",
+			"AI 生成请求未通过",
+			"模型列表可访问，但最小生成请求异常；请在配置页重新检测。",
+			"config",
+		)
+	if not isinstance(text, str) or not text.strip():
+		return _check(
+			"ai_connection",
+			"AI 接口连接",
+			"warning",
+			"AI 服务未返回文本",
+			f"模型 {model} 的生成请求没有返回可读内容，评分任务可能中断。{hint}",
+			"config",
+		)
+	return None
 
 
 def _python_runtime_checks() -> list[dict[str, str]]:

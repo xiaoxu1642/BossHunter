@@ -13,12 +13,13 @@ from bosshunter.collection.platforms.liepin import LiepinBrowser, LiepinCollecto
 from bosshunter.db import get_db, get_collected_combos, get_page_progress, mark_combo_collected, upsert_page_progress
 
 REQUEST = PlatformCollectionRequest("liepin", ["AI"], ["上海"], {"上海": "020"}, max_pages=2)
-JOB = {"source_job_id": "review-job", "title": "AI 工程师", "company": "测试公司", "url": "https://www.liepin.com/job/1001.shtml"}
+JOB = {"source_job_id": "review-job", "title": "AI 工程师", "company": "测试公司", "salary": "15-25K", "url": "https://www.liepin.com/job/1001.shtml"}
 
 
 @pytest.fixture(autouse=True)
 def safe_timing():
-    with patch("bosshunter.collection.platforms.liepin.SendWindowChecker.is_active", return_value=True), patch("bosshunter.collection.platforms.liepin.should_take_day_off", return_value=False):
+    # 断点续采用例验证浏览器路径：关掉 HTTP 详情，避免真实网络请求。
+    with patch("bosshunter.collection.platforms.liepin.SendWindowChecker.is_active", return_value=True), patch("bosshunter.collection.platforms.liepin.should_take_day_off", return_value=False), patch("bosshunter.collection.platforms.liepin.LiepinCollector._http_detail_enabled", return_value=False):
         yield
 
 

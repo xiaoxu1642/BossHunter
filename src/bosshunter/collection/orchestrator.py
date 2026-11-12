@@ -8,7 +8,9 @@ from threading import Event
 from typing import Any, Callable
 from uuid import uuid4
 
+from bosshunter.cities import get_city_map
 from bosshunter.collection.base import CollectionError, CollectorHooks
+from bosshunter.collection.city_yield import normalize_city_policy
 from bosshunter.collection.models import (
     CollectionProgress,
     JobCandidate,
@@ -22,10 +24,12 @@ from bosshunter.collection.platforms.zhilian import ZhilianCollector, get_zhilia
 from bosshunter.collection.registry import CollectorRegistry
 from bosshunter.collection_run_store import (
     boss_combo_key, boss_resume_options, claim_boss_resume, create_collection_run,
-    save_boss_checkpoint, update_collection_run,
+    save_boss_checkpoint, save_city_state, append_run_job, update_collection_run,
 )
-from bosshunter.db import get_db, insert_job_if_new, job_identity_exists
+from bosshunter.db import get_db, insert_job_if_new, job_identity_exists, recompute_outsourcing
+from bosshunter.employment import internship_config_error
 from bosshunter.job_filters import matching_blocked_company, matching_deal_breaker
+from bosshunter.outsourcing import load_rules
 
 
 SUPPORTED_PLATFORMS = {"boss", "zhilian", "51job", "liepin"}
@@ -99,6 +103,11 @@ def normalize_collection_options(config: dict[str, Any], raw_options: dict[str, 
             "sort": str(base.get("sort") or ("newest" if platform == "boss" else "default")),
             "filters": normalize_boss_search_filters(base.get("filters")) if platform == "boss" else {},
         }
+        if platform == "boss":
+            platforms[platform]["city_yield_policy"] = normalize_city_policy(base.get("city_yield_policy"))
+            platforms[platform]["keyword_start"] = base.get("keyword_start", {})
+        elif "city_yield_policy" in search:
+            raise ValueError("城市产出策略仅支持 BOSS")
 
     order = supplied.get("platform_order")
     if order is None:
@@ -117,14 +126,28 @@ def normalize_collection_options(config: dict[str, Any], raw_options: dict[str, 
     if supplied and selected_platforms is not None:
         selected = {str(key).strip() for key in selected_platforms if str(key).strip()}
         order = [platform for platform in order if platform in selected]
+    raw_ignore = supplied.get("ignore_checkpoint")
+    if raw_ignore is not None and not isinstance(raw_ignore, bool):
+        raise ValueError("ignore_checkpoint 必须是布尔值")
     options = {
         "platform_order": order,
         "auto_score": supplied.get("auto_score", False) is True,
         "platforms": {platform: platforms[platform] for platform in order if platform in platforms},
     }
+    if raw_ignore is True:
+        options["ignore_checkpoint"] = True
     if supplied.get("resume_run_id"):
         options["resume_run_id"] = supplied["resume_run_id"]
-    return validate_collection_options(options)
+    if "continuous_collection" in supplied:
+        options["continuous_collection"] = supplied["continuous_collection"]
+    normalized = validate_collection_options(options)
+    if "boss" in normalized["platform_order"]:
+        effective = {"profile": config.get("profile", {}), "platforms": {
+            "boss": {"search": {"filters": normalized["platforms"]["boss"]["filters"]}},
+        }}
+        if conflict := internship_config_error(effective):
+            raise ValueError(conflict)
+    return normalized
 
 
 def validate_collection_options(options: dict[str, Any]) -> dict[str, Any]:
@@ -144,6 +167,15 @@ def validate_collection_options(options: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(options.get("auto_score", False), bool):
         raise ValueError("auto_score 必须是布尔值")
     normalized: dict[str, Any] = {"platform_order": order, "auto_score": bool(options.get("auto_score")), "platforms": {}}
+    if options.get("ignore_checkpoint") is not None and not isinstance(options.get("ignore_checkpoint"), bool):
+        raise ValueError("ignore_checkpoint 必须是布尔值")
+    if options.get("ignore_checkpoint") is True:
+        normalized["ignore_checkpoint"] = True
+    if "continuous_collection" in options:
+        from bosshunter.collection.session import normalize_session_options
+        normalized["continuous_collection"] = normalize_session_options(options["continuous_collection"])
+        if normalized["continuous_collection"]["enabled"] and order != ["boss"]:
+            raise ValueError("持续采集只支持单独 BOSS 采集")
     if options.get("resume_run_id"):
         if not isinstance(options["resume_run_id"], str) or order != ["boss"]:
             raise ValueError("继续采集必须选择原来的 BOSS 任务")
@@ -210,6 +242,28 @@ def validate_collection_options(options: dict[str, Any]) -> dict[str, Any]:
             "sort": sort,
             "filters": normalize_boss_search_filters(value.get("filters")) if platform == "boss" else {},
         }
+        if platform == "boss":
+            catalog = get_city_map()
+            resolved = [(city, str(city_codes.get(city) or catalog.get(city) or catalog.get(city.removesuffix("市")) or "")) for city in cities]
+            if not any(code for _, code in resolved):
+                raise ValueError(f"BOSS 没有可采集的有效城市：{'、'.join(cities)}；请填写具体城市或提供已确认的 BOSS 地区编码")
+            seen_codes = set()
+            unique_cities = []
+            for city, code in resolved:
+                if not code or code not in seen_codes:
+                    unique_cities.append(city)
+                    if code:
+                        seen_codes.add(code)
+            normalized["platforms"][platform].update(
+                cities=unique_cities, city_codes={city: code for city, code in resolved if code},
+                city_yield_policy=normalize_city_policy(value.get("city_yield_policy")),
+                keyword_start=value.get("keyword_start", {}),
+            )
+            cursor = value.get("keyword_start", {})
+            if not isinstance(cursor, dict) or any(type(v) is not int or not 0 <= v < len(keywords) for v in cursor.values()):
+                raise ValueError("关键词游标无效")
+        elif "city_yield_policy" in value:
+            raise ValueError("城市产出策略仅支持 BOSS")
     return normalized
 
 
@@ -234,22 +288,49 @@ class _SharedProcessor:
         self.stop_event = stop_event
         self.config = config
         self.emit = emit
+        self.outsourcing_rules = load_rules(config)
+        recompute_outsourcing(conn, self.outsourcing_rules)
         self.progress = CollectionProgress(
             run_id=run_id, platform=request.platform, platform_index=platform_index,
             platform_total=platform_total, phase="queued", target=None,
             max_pages=request.max_pages,
         )
         self.new_job_ids: list[str] = []
+        self.filter_records: list[dict[str, str]] = []
+        self.error_records: list[dict[str, Any]] = []
+        self.city_context = None
+        self.last_receipt = {"sequence": 0, "inserted": False}
+
+    def bind_city(self, city, tracker) -> None:
+        self.city_context = (city, tracker)
 
     def event(self, *, phase: str | None = None, **values: Any) -> None:
         if phase:
             self.progress.phase = phase
+        candidate = values.pop("filtered_candidate", None)
         if values.pop("increment_filtered", False):
             self.progress.filtered += 1
+            if isinstance(candidate, JobCandidate):
+                self.filter_records.append({
+                    "title": candidate.title[:300], "company": candidate.company[:300],
+                    "source_job_id": candidate.source_job_id[:200],
+                    "reason": str(values.get("message") or "命中过滤规则")[:500],
+                })
+                self.filter_records = self.filter_records[-200:]
         for key, value in values.items():
             if hasattr(self.progress, key):
                 setattr(self.progress, key, value)
         self.emit(self.progress)
+
+    def record_failure(self, kind: str, reason: str, candidate: JobCandidate | None = None) -> None:
+        self.error_records.append({
+            "kind": kind, "reason": reason[:500],
+            "title": candidate.title[:300] if candidate else "",
+            "company": candidate.company[:300] if candidate else "",
+            "city": self.progress.city, "keyword": self.progress.keyword,
+            "page": self.progress.page,
+        })
+        self.error_records = self.error_records[-200:]
 
     def inspect(self, candidate: JobCandidate) -> bool:
         self.progress.seen += 1
@@ -263,28 +344,47 @@ class _SharedProcessor:
             self.event()
             return False
         profile = self.config.get("profile", {}) if isinstance(self.config.get("profile"), dict) else {}
-        if matching_deal_breaker(candidate.title, profile.get("deal_breakers") or []):
-            self.progress.filtered += 1
-            self.event(message="职位名命中过滤规则")
+        if matched := matching_deal_breaker(candidate.title, profile.get("deal_breakers") or []):
+            self.event(message=f"职位名命中排除词：{matched}", increment_filtered=True, filtered_candidate=candidate)
             return False
-        if matching_blocked_company(candidate.company, profile.get("blocked_companies") or []):
-            self.progress.filtered += 1
-            self.event(message="公司命中过滤规则")
+        if matched := matching_blocked_company(candidate.company, profile.get("blocked_companies") or []):
+            self.event(message=f"公司命中屏蔽规则：{matched}", increment_filtered=True, filtered_candidate=candidate)
             return False
         self.event()
         return True
 
     def save(self, candidate: JobCandidate) -> bool:
+        self.last_receipt = {"sequence": self.last_receipt["sequence"] + 1, "inserted": False}
         profile = self.config.get("profile", {}) if isinstance(self.config.get("profile"), dict) else {}
-        if matching_deal_breaker(candidate.jd, profile.get("jd_deal_breakers") or []):
-            self.progress.filtered += 1
-            self.event(message="JD 命中过滤规则")
+        if matched := matching_deal_breaker(candidate.jd, profile.get("jd_deal_breakers") or []):
+            self.event(message=f"JD 命中排除词：{matched}", increment_filtered=True, filtered_candidate=candidate)
             return True
         try:
-            inserted = insert_job_if_new(self.conn, candidate.as_job_record())
+            if self.city_context:
+                city, tracker = self.city_context
+                with self.conn:
+                    inserted = insert_job_if_new(
+                        self.conn, candidate.as_job_record(), rules=self.outsourcing_rules, commit=False,
+                    )
+                    if inserted:
+                        elapsed = tracker.elapsed_ms()
+                        state = tracker.with_insert(candidate.storage_id, elapsed)
+                        append_run_job(self.conn, self.run_id, candidate.storage_id)
+                        save_city_state(self.conn, self.run_id, city, state, commit=False)
+                self.last_receipt.update(inserted=inserted, job_id=candidate.storage_id,
+                                         event_elapsed_ms=elapsed if inserted else 0, search_city=city)
+                if inserted:
+                    tracker.record_inserted(candidate.storage_id, elapsed)
+                    self.last_receipt["recorded"] = True
+            else:
+                inserted = insert_job_if_new(self.conn, candidate.as_job_record(), rules=self.outsourcing_rules)
         except Exception as exc:
             self.progress.save_failed += 1
-            self.event(message=f"保存岗位失败：{type(exc).__name__}")
+            reason = f"保存岗位失败：{type(exc).__name__}"
+            self.record_failure("save", reason, candidate)
+            self.event(message=reason)
+            if self.city_context:
+                raise CollectionError("persistence_error", "岗位或城市账本保存失败，采集已停止") from exc
             return True
         if inserted:
             self.new_job_ids.append(candidate.storage_id)
@@ -325,7 +425,7 @@ class CollectionOrchestrator:
         resume_id = raw_options.get("resume_run_id") if isinstance(raw_options, dict) else None
         if resume_id:
             # The stored search is authoritative, including filters and page limits.
-            raw_options = boss_resume_options(self.db_path, str(resume_id))
+            raw_options = boss_resume_options(self.db_path, str(resume_id), session_id=self.config.get("_collection_session_id"))
         options = normalize_collection_options(self.config, raw_options)
         order = options["platform_order"]
         states: dict[str, dict[str, Any]] = {
@@ -335,15 +435,18 @@ class CollectionOrchestrator:
         previous = None
         if resume_id:
             self.run_id = str(resume_id)
-            previous = claim_boss_resume(self.db_path, self.run_id, self.task_id)
+            previous = claim_boss_resume(self.db_path, self.run_id, self.task_id, session_id=self.config.get("_collection_session_id"))
             states = deepcopy(previous["platform_states"])
             states.setdefault("boss", {}).update(status="queued", reason_code="", message="继续原任务")
         else:
             create_collection_run(
                 self.db_path, run_id=self.run_id, task_id=self.task_id, options=options,
                 platform_states=states, enable_boss_resume=order == ["boss"],
+                session_id=self.config.get("_collection_session_id"),
+                session_round=self.config.get("_collection_session_round"),
             )
         checkpoint_pages = dict(previous["boss_checkpoint"]["pages"]) if previous else {}
+        city_states = deepcopy(previous["boss_checkpoint"].get("cities", {})) if previous else {}
         all_new_ids: list[str] = list(previous["collected_job_ids"]) if previous else []
         platform_results: list[PlatformCollectionResult] = []
         conn = get_db(self.db_path)
@@ -352,6 +455,10 @@ class CollectionOrchestrator:
             checkpoint_pages[boss_combo_key(city, keyword)] = page
             save_boss_checkpoint(conn, self.run_id, checkpoint_pages)
 
+        def city_checkpoint(city: str, state: dict) -> None:
+            save_city_state(conn, self.run_id, city, state)
+            city_states[city] = state
+
         try:
             for index, platform in enumerate(order, start=1):
                 if self.stop_event is not None and self.stop_event.is_set():
@@ -359,7 +466,16 @@ class CollectionOrchestrator:
                     states[platform]["reason_code"] = "user_stopped"
                     break
                 raw = options["platforms"][platform]
-                request = PlatformCollectionRequest(platform=platform, **raw)
+                if platform == "boss":
+                    unresolved = [city for city in raw["cities"] if not raw["city_codes"].get(city)]
+                    log = self.config.get("_workbench_log")
+                    if unresolved and callable(log):
+                        log(f"跳过未识别的 BOSS 地区：{'、'.join(unresolved)}；继续采集其他有效城市，原配置保留")
+                request = PlatformCollectionRequest(
+                    platform=platform,
+                    ignore_checkpoint=bool(options.get("ignore_checkpoint")),
+                    **raw,
+                )
                 states[platform]["status"] = "running"
                 self._persist(states, all_new_ids, platform, status="running")
                 processor = _SharedProcessor(
@@ -371,14 +487,18 @@ class CollectionOrchestrator:
                 )
                 if previous:
                     processor.new_job_ids = list(previous["collected_job_ids"])
+                    processor.filter_records = list(previous["platform_states"].get(platform, {}).get("filter_records") or [])[-200:]
+                    processor.error_records = list(previous["platform_states"].get(platform, {}).get("error_records") or [])[-200:]
                     for name in ("seen", "duplicate", "filtered", "parse_failed", "save_failed"):
                         setattr(processor.progress, name, int(previous["platform_states"].get(platform, {}).get(name) or 0))
                 prior_save_failures = processor.progress.save_failed
                 # Bind the processor into the callback after construction so the
                 # current platform's progress is not confused with prior IDs.
-                processor.emit = lambda progress, p=platform, processor_ref=processor: self._emit(
-                    states, p, progress, all_new_ids, processor_ref.new_job_ids
-                )
+                def emit(progress, p=platform, processor_ref=processor):
+                    states[p]["filter_records"] = list(processor_ref.filter_records)
+                    states[p]["error_records"] = list(processor_ref.error_records)
+                    self._emit(states, p, progress, all_new_ids, processor_ref.new_job_ids)
+                processor.emit = emit
                 hooks = CollectorHooks(
                     stop_event=self.stop_event,
                     on_list_candidate=processor.inspect,
@@ -388,6 +508,10 @@ class CollectionOrchestrator:
                     can_checkpoint=lambda p=processor, baseline=prior_save_failures: p.progress.save_failed == baseline,
                     completed_page=(lambda city, keyword: checkpoint_pages.get(boss_combo_key(city, keyword), 0)),
                     on_page_complete=checkpoint if order == ["boss"] else lambda *_: None,
+                    last_save_receipt=lambda p=processor: p.last_receipt,
+                    on_city_start=processor.bind_city,
+                    city_state=lambda city: city_states.get(city, {}),
+                    on_city_state=city_checkpoint,
                 )
                 try:
                     collector = (
@@ -405,7 +529,7 @@ class CollectionOrchestrator:
                 except CollectionError as exc:
                     result = PlatformCollectionResult(platform, "blocked", exc.code, exc.message, error=str(exc))
                 except Exception as exc:
-                    result = PlatformCollectionResult(platform, "failed", "network_error", f"{platform} 采集失败", error=str(exc)[:500])
+                    result = PlatformCollectionResult(platform, "failed", "collection_error", f"{platform} 采集失败", error=str(exc)[:500])
                 result.new_job_ids = list(processor.new_job_ids)
                 result.counts = self._counts(processor.progress)
                 if platform == "boss" and result.status in {"completed", "completed_with_shortage"}:
@@ -427,12 +551,14 @@ class CollectionOrchestrator:
                     "filtered": processor.progress.filtered,
                     "parse_failed": processor.progress.parse_failed,
                     "save_failed": processor.progress.save_failed,
+                    "skipped": processor.progress.skipped,
                     "keyword": processor.progress.keyword,
                     "city": processor.progress.city,
                     "page": processor.progress.page,
                     "max_pages": processor.progress.max_pages,
                     "reason_code": result.reason_code,
                     "message": result.message,
+                    "city_results": result.city_results,
                 })
                 all_new_ids.extend(result.new_job_ids)
                 self._persist(states, all_new_ids, platform, stop_reason=result.reason_code, error=result.error)
@@ -442,7 +568,7 @@ class CollectionOrchestrator:
                 # they have an equally explicit platform-local classification.
                 if (
                     (result.status == "blocked" and result.reason_code != "login_required")
-                    or result.reason_code in {"user_stopped", "browser_disconnected"}
+                    or result.reason_code in {"user_stopped", "browser_disconnected", "timing_gap", "persistence_error"}
                     or (self.stop_event and self.stop_event.is_set())
                 ):
                     break
@@ -451,11 +577,12 @@ class CollectionOrchestrator:
             conn.close()
 
         unique_new_ids = list(dict.fromkeys(str(job_id) for job_id in all_new_ids if str(job_id)))
-        stopped = bool(self.stop_event and self.stop_event.is_set()) or any(r.reason_code == "user_stopped" for r in platform_results)
+        stop_requested = bool(self.stop_event and self.stop_event.is_set())
+        stopped = stop_requested or any(r.status == "stopped" or r.reason_code == "user_stopped" for r in platform_results)
         errors = any(r.status in {"blocked", "failed"} for r in platform_results)
         shortages = any(r.status == "completed_with_shortage" for r in platform_results)
         outcome = "stopped" if stopped else "completed_with_errors" if errors else "completed_with_shortage" if shortages else "completed"
-        if options["auto_score"] and unique_new_ids and not stopped:
+        if options["auto_score"] and unique_new_ids and not stopped and not errors and not any(r.reason_code == "timing_gap" for r in platform_results):
             try:
                 self._emit_scoring(states, unique_new_ids)
                 from bosshunter.ai.scorer import score_jobs
@@ -466,7 +593,7 @@ class CollectionOrchestrator:
             except Exception as exc:
                 outcome = "completed_with_errors"
                 self._persist(states, unique_new_ids, "", error=f"自动评分失败：{str(exc)[:500]}")
-        self._persist(states, unique_new_ids, "", status=outcome, stop_reason="user_stopped" if stopped else "")
+        self._persist(states, unique_new_ids, "", status=outcome, stop_reason=getattr(self.stop_event, "reason", "user_stopped") if stop_requested else next((r.reason_code for r in reversed(platform_results) if r.reason_code), ""))
         return {
             "run_id": self.run_id,
             "status": outcome,
@@ -480,10 +607,12 @@ class CollectionOrchestrator:
         return {
             "seen": progress.seen, "new": progress.new, "duplicate": progress.duplicate,
             "filtered": progress.filtered, "parse_failed": progress.parse_failed, "save_failed": progress.save_failed,
+            "skipped": progress.skipped,
         }
 
     def _parse_failed(self, processor: _SharedProcessor, reason: str) -> None:
         processor.progress.parse_failed += 1
+        processor.record_failure("parse", reason)
         processor.event(phase="loading_detail", message=reason)
 
     def _emit(
@@ -499,9 +628,13 @@ class CollectionOrchestrator:
             "status": "running", "new": progress.new, "target": progress.target, "percent": progress.percent,
             "seen": progress.seen, "duplicate": progress.duplicate, "filtered": progress.filtered,
             "parse_failed": progress.parse_failed, "save_failed": progress.save_failed,
+            "skipped": progress.skipped,
             "keyword": progress.keyword, "city": progress.city, "page": progress.page,
             "max_pages": progress.max_pages, "phase": progress.phase, "reason_code": progress.reason_code,
             "message": progress.message,
+            "city_results": progress.city_results, "city_elapsed_ms": progress.city_elapsed_ms,
+            "next_check_ms": progress.next_check_ms, "last_window_new": progress.last_window_new,
+            "city_new_total": progress.city_new_total,
         })
         callback = self.config.get("_workbench_collect_progress")
         state = {
@@ -528,6 +661,7 @@ class CollectionOrchestrator:
                 "filtered": sum(int(value.get("filtered") or 0) for value in states.values()),
                 "parse_failed": sum(int(value.get("parse_failed") or 0) for value in states.values()),
                 "save_failed": sum(int(value.get("save_failed") or 0) for value in states.values()),
+                "skipped": sum(int(value.get("skipped") or 0) for value in states.values()),
                 "progress": {"run_id": self.run_id, "outcome": "scoring", "current_platform": "", "platforms": deepcopy(states)},
             })
 

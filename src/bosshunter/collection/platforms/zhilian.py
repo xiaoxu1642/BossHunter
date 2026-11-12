@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, quote, urljoin, urlparse
 
+from bosshunter.ai.prefilter import salary_filter_result
 from bosshunter.browser import (
     click as browser_click,
     close_tab,
@@ -32,8 +33,6 @@ from bosshunter.browser import (
 from bosshunter.collection.base import CollectionBlockedError, CollectionError, CollectorHooks
 from bosshunter.collection.models import JobCandidate, PlatformCollectionRequest, PlatformCollectionResult
 from bosshunter.db import (
-    delete_page_progress,
-    get_collected_combos,
     get_page_progress,
     mark_combo_collected,
     prune_collected_combos,
@@ -41,13 +40,13 @@ from bosshunter.db import (
     upsert_page_progress,
 )
 from bosshunter.job_filters import matching_blocked_company, matching_deal_breaker
-from bosshunter.throttle import SendWindowChecker, should_take_day_off
+from bosshunter.throttle import resolve_collection_windows, SendWindowChecker, should_take_day_off
 
 
 SEARCH_URL = "https://www.zhaopin.com/sou/jl{city_code}/"
 DETAIL_BASE_URL = "https://www.zhaopin.com"
 CITY_SNAPSHOT_PATH = Path(__file__).resolve().parents[2] / "data" / "zhilian_cities.json"
-_INTERNSHIP_TITLE_TERMS = ("实习", "intern", "internship", "管培")
+_INTERNSHIP_TITLE_TERMS = ("实习", "intern", "internship")  # 本地定制：管培不算实习
 LIST_ITEM_CLASSES = ("joblist-box__item", "joblist-item", "job-card")
 TITLE_CLASSES = ("summary-planes__title", "jobinfo__name", "job-name", "job-title")
 SALARY_CLASSES = ("summary-planes__salary", "jobinfo__salary", "job-salary", "salary")
@@ -108,7 +107,7 @@ def load_zhilian_city_snapshot() -> dict[str, Any]:
 
 
 def _is_internship(title: str) -> bool:
-    """判断岗位是否为实习/管培（只查标题）。"""
+    """判断岗位是否为实习（只查标题，管培不算）。"""
     t = (title or "").lower()
     return any(s in t for s in _INTERNSHIP_TITLE_TERMS)
 
@@ -253,7 +252,10 @@ JS_EXTRACT_LIST = """
   const strongLoginWallText = /登录查看更多|登录查看全部|立即登录/.test(text);
   const loginWallText = /请先登录|请登录|登录后(?:查看|继续|获取)|登录失效|账号登录|扫码登录/.test(text);
   const loginDialog = Boolean(document.querySelector('[role="dialog"], .login-dialog, [class*="login-modal"], [class*="login-dialog"]'));
-  const loginRequired = strongLoginWallText || (loginWallText && (!searchInput || loginDialog || !items.length));
+  const loginPage = /(?:^|\\/)(?:passport|login)(?:\\/|$)/i.test(window.location.pathname);
+  // A sidebar login CTA is not a wall when job cards remain readable.
+  const loginRequired = loginPage || /登录失效/.test(text)
+    || ((strongLoginWallText || loginWallText) && (loginDialog || !items.length));
   const status = blockedMatch ? 'blocked' : loginRequired ? 'login_required' : items.length ? 'ready' : hasListRegion ? 'empty' : 'selector_changed';
   return JSON.stringify({status, blocked_code: blockedMatch ? blockedMatch[0] : '', items, has_search_input: Boolean(searchInput)});
 })()
@@ -655,15 +657,24 @@ def _detail_href(node: _Node) -> str:
 def parse_zhilian_list_html(html: str, *, city: str = "", source_keyword: str = "") -> list[dict[str, str]]:
     """Parse a saved search-page fixture without opening a browser."""
     blocked = _blocked_reason(html)
-    if blocked:
+    if blocked and (blocked[0] != "login_required" or "账号异常" in html or "登录失效" in html):
         raise CollectionBlockedError(*blocked)
     root = _parse_tree(html)
+    login_dialog = any(
+        node.attrs.get("role") == "dialog"
+        or any(name in node.attrs.get("class", "") for name in ("login-dialog", "login-modal"))
+        for node in root.descendants()
+    )
+    if blocked and login_dialog:
+        raise CollectionBlockedError(*blocked)
     nodes = [
         node for node in root.descendants()
         if any(node.has_class(name) for name in LIST_ITEM_CLASSES)
         and not any(node.parent and node.parent.has_class(name) for name in LIST_ITEM_CLASSES)
     ]
     if not nodes:
+        if blocked:
+            raise CollectionBlockedError(*blocked)
         visible = root.text()
         if visible and len(visible) > 40:
             raise CollectionError("selector_changed", "智联列表选择器未命中，可能是页面结构变化")
@@ -690,6 +701,8 @@ def parse_zhilian_list_html(html: str, *, city: str = "", source_keyword: str = 
             "url": detail_url,
             "source_keyword": source_keyword,
         })
+    if blocked and not result:
+        raise CollectionBlockedError(*blocked)
     return result
 
 
@@ -801,18 +814,27 @@ class ZhilianCollector:
             )
 
     def _passes_filters(self, candidate: JobCandidate) -> bool:
+        return not self._filter_reason(candidate)
+
+    def _filter_reason(self, candidate: JobCandidate) -> str:
         """collector 增值过滤：deal_breakers / blocked_company / 实习。"""
         profile = self.config.get("profile", {}) if isinstance(self.config.get("profile"), dict) else {}
-        if matching_deal_breaker(candidate.title, profile.get("deal_breakers") or []):
-            return False
-        if matching_blocked_company(candidate.company, profile.get("blocked_companies") or []):
-            return False
-        if matching_deal_breaker(candidate.jd, profile.get("jd_deal_breakers") or []):
-            return False
+        if matched := matching_deal_breaker(candidate.title, profile.get("deal_breakers") or []):
+            return f"职位名命中排除词：{matched}"
+        if matched := matching_blocked_company(candidate.company, profile.get("blocked_companies") or []):
+            return f"公司命中屏蔽规则：{matched}"
+        if matched := matching_deal_breaker(candidate.jd, profile.get("jd_deal_breakers") or []):
+            return f"JD 命中排除词：{matched}"
         allow_internship = bool(profile.get("allow_internship", False))
         if not allow_internship and _is_internship(candidate.title):
-            return False
-        return True
+            return "当前设置不接受实习岗位"
+        return ""
+
+    def _salary_block_reason(self, candidate: JobCandidate) -> str | None:
+        """薪资硬过滤（与 quick_score 同规则）；返回拦截原因，None 表示通过。"""
+        profile = self.config.get("profile", {}) if isinstance(self.config.get("profile"), dict) else {}
+        score, reason = salary_filter_result(candidate.salary, profile)
+        return None if score > 0 else reason
 
     def _resume_ttl_hours(self) -> int:
         """断点续采有效期（默认 24h），与 51job/liepin 同规则。"""
@@ -1092,7 +1114,6 @@ class ZhilianCollector:
         self,
         request: PlatformCollectionRequest,
         hooks: CollectorHooks,
-        collected_combos: set[tuple[str, str]],
     ) -> PlatformCollectionResult | None:
         """API-fetch 采集模式。
 
@@ -1116,22 +1137,28 @@ class ZhilianCollector:
         allow_internship = bool(profile.get("allow_internship", False))
 
         api_failed = False
+        outcomes = {"scanned": 0, "resumed": 0, "skipped": 0}
+        total_combos = len(request.cities) * len(request.keywords)
         try:
             for city in request.cities:
                 city_id = str(request.city_codes.get(city) or "").strip()
                 for kw in request.keywords:
                     if hooks.stop_event is not None and hooks.stop_event.is_set():
                         return PlatformCollectionResult(self.platform, "stopped", "user_stopped", "用户已停止")
-                    if (city, kw) in collected_combos:
-                        self._log(hooks, f"智联 {kw} 断点续采：已完成后跳过",
-                                  phase="completed_keyword", keyword=kw, city=city)
-                        continue
-                    saved_page = get_page_progress(self.safety_conn, "zhilian", city, kw) if self.safety_conn is not None else 0
+                    saved_page = 0
+                    if self.safety_conn is not None and not request.ignore_checkpoint:
+                        saved_page = get_page_progress(
+                            self.safety_conn, "zhilian", city, kw,
+                            within_hours=self._resume_ttl_hours(),
+                        )
                     start_page = saved_page + 1 if saved_page > 0 else 1
                     if start_page > max_pages:
                         if self.safety_conn is not None:
                             mark_combo_collected(self.safety_conn, "zhilian", city, kw)
-                            delete_page_progress(self.safety_conn, "zhilian", city, kw)
+                        outcomes["skipped"] += 1
+                        self._log(hooks, f"智联 {kw} 已采到最大页，{self._resume_ttl_hours()}h 内无剩余页，跳过本词",
+                                  phase="completed_keyword", keyword=kw, city=city,
+                                  skipped=outcomes["skipped"])
                         continue
 
                     kw_encoded = quote(kw)
@@ -1144,12 +1171,23 @@ class ZhilianCollector:
                     )
                     if api_failed:
                         return None
+                    outcomes["resumed" if saved_page > 0 else "scanned"] += 1
         finally:
             if owns_host:
                 self.browser.close_tab(host_target)
 
-        return PlatformCollectionResult(self.platform, "completed", "search_exhausted",
-                                        "智联 API 采集完毕")
+        if outcomes["skipped"] and outcomes["skipped"] == total_combos:
+            return PlatformCollectionResult(
+                self.platform, "completed", "no_remaining_pages",
+                f"智联 上次已采到设定的最大页，{self._resume_ttl_hours()} 小时内没有剩余页可采；"
+                f"如需从第 1 页重扫，请在采集设置里勾选「从第 1 页重扫」",
+            )
+        message = "智联 API 采集完毕"
+        if outcomes["resumed"]:
+            message += f"；{outcomes['resumed']} 个组合从上次页码续采"
+        if outcomes["skipped"]:
+            message += f"；{outcomes['skipped']} 个组合 24h 内已采完、无剩余页"
+        return PlatformCollectionResult(self.platform, "completed", "search_exhausted", message)
 
     def _collect_keyword_api(
         self,
@@ -1205,7 +1243,13 @@ class ZhilianCollector:
                 cand = self._item_to_candidate(item, city, city_id, kw)
                 if cand is None:
                     continue
-                if not self._passes_filters(cand):
+                salary_reason = self._salary_block_reason(cand)
+                if salary_reason:
+                    hooks.on_event(message=f"智联 列表预筛：{salary_reason}", increment_filtered=True, filtered_candidate=cand)
+                    continue
+                filter_reason = self._filter_reason(cand)
+                if filter_reason:
+                    hooks.on_event(message=filter_reason, increment_filtered=True, filtered_candidate=cand)
                     continue
                 if not hooks.on_list_candidate(cand):
                     continue
@@ -1218,11 +1262,13 @@ class ZhilianCollector:
             if len(jobs_list) < API_PAGE_SIZE:
                 self._log(hooks, f"智联 {kw} 已到末页（本页 {len(jobs_list)} 条 < {API_PAGE_SIZE}），结束本词",
                           phase="loading_list", keyword=kw, city=city, page=page)
+                # 本词已无更多结果：断点推进到上限页，下次直接跳过本词
+                if self.safety_conn is not None:
+                    upsert_page_progress(self.safety_conn, "zhilian", city, kw, max_pages)
                 break
 
         if self.safety_conn is not None:
             mark_combo_collected(self.safety_conn, "zhilian", city, kw)
-            delete_page_progress(self.safety_conn, "zhilian", city, kw)
         return False
 
     def _api_fetch_enabled(self) -> bool:
@@ -1242,48 +1288,50 @@ class ZhilianCollector:
         if any(not str(request.city_codes.get(city) or "").strip() for city in request.cities):
             return PlatformCollectionResult(self.platform, "failed", "no_valid_city", "智联城市编码未配置")
 
-        throttle_cfg = self.config.get("throttle", {}) if isinstance(self.config.get("throttle"), dict) else {}
-        send_windows = throttle_cfg.get("send_windows", ["09:00-16:00"])
-        if not SendWindowChecker(send_windows).is_active():
+        collect_windows = resolve_collection_windows(self.config)
+        if not SendWindowChecker(collect_windows).is_active():
             return PlatformCollectionResult(self.platform, "completed", "outside_window",
-                                            f"当前不在采集时间窗口内（{send_windows}）")
+                                            f"当前不在采集时间窗口内（{collect_windows}）")
+        throttle_cfg = self.config.get("throttle", {}) if isinstance(self.config.get("throttle"), dict) else {}
         if should_take_day_off(float(throttle_cfg.get("day_off_probability", 0.05))):
             return PlatformCollectionResult(self.platform, "completed", "day_off",
                                             "今日随机休息，跳过智联采集")
 
-        # 词级断点续采：跳过最近 N 小时内已完成的 (city, keyword) 组合。
-        collected_combos: set[tuple[str, str]] = set()
+        # 页级断点续采：只跳过「已采到最大页」的词，未采满的词从上次页码的下一页继续。
+        # 超过有效期（默认 24h）的旧断点视为过期，下次从第 1 页重新采集。
         if self.safety_conn is not None:
             all_keywords = set(request.keywords)
             prune_collected_combos(self.safety_conn, "zhilian", all_keywords)
             prune_page_progress(self.safety_conn, "zhilian", all_keywords)
-            collected_combos = get_collected_combos(
-                self.safety_conn, "zhilian", within_hours=self._resume_ttl_hours()
-            )
 
         # API-fetch 优先：尝试 API 模式，不可用时降级到 DOM 模式
         if self._api_fetch_enabled():
-            api_result = self._collect_api(request, hooks, collected_combos)
+            api_result = self._collect_api(request, hooks)
             if api_result is not None:
                 return api_result
             hooks.on_event(message="智联 API-fetch 不可用，降级到 DOM 模式")
 
         detail_requests = 0
+        outcomes = {"scanned": 0, "resumed": 0, "skipped": 0}
+        total_combos = len(request.cities) * len(request.keywords)
         for city in request.cities:
             for keyword in request.keywords:
-                if (city, keyword) in collected_combos:
-                    hooks.on_event(phase="completed_keyword", keyword=keyword, city=city,
-                                   message=f"智联 {keyword} 断点续采：{self._resume_ttl_hours()}h 内已完成，整词跳过")
-                    continue
-                # 页级断点：从上次采到页码的下一页继续
-                saved_page = get_page_progress(self.safety_conn, "zhilian", city, keyword) if self.safety_conn is not None else 0
+                if hooks.stop_event is not None and hooks.stop_event.is_set():
+                    return PlatformCollectionResult(self.platform, "stopped", "user_stopped", "用户已停止")
+                saved_page = 0
+                if self.safety_conn is not None and not request.ignore_checkpoint:
+                    saved_page = get_page_progress(
+                        self.safety_conn, "zhilian", city, keyword,
+                        within_hours=self._resume_ttl_hours(),
+                    )
                 start_page = saved_page + 1 if saved_page > 0 else 1
                 if start_page > request.max_pages:
                     if self.safety_conn is not None:
                         mark_combo_collected(self.safety_conn, "zhilian", city, keyword)
-                        delete_page_progress(self.safety_conn, "zhilian", city, keyword)
+                    outcomes["skipped"] += 1
                     hooks.on_event(phase="completed_keyword", keyword=keyword, city=city,
-                                   message=f"智联 {keyword} 页级断点已超最大页（{saved_page}/{request.max_pages}），视为已采完，跳过")
+                                   skipped=outcomes["skipped"],
+                                   message=f"智联 {keyword} 已采到最大页，{self._resume_ttl_hours()}h 内无剩余页，跳过本词")
                     continue
                 target_id: str | None = None
                 try:
@@ -1342,6 +1390,9 @@ class ZhilianCollector:
                             message = str(exc) or "智联列表解析失败，可能是页面结构变化"
                             return PlatformCollectionResult(self.platform, "blocked", code, message)
                         if not items:
+                            # 本词已无更多结果：断点推进到上限页，下次直接跳过本词
+                            if self.safety_conn is not None:
+                                upsert_page_progress(self.safety_conn, "zhilian", city, keyword, request.max_pages)
                             break
                         for raw_item in items:
                             card_index = raw_item.get("card_index") if isinstance(raw_item, dict) else None
@@ -1361,6 +1412,16 @@ class ZhilianCollector:
                                 clicked = self._parse_payload(
                                     self.browser.evaluate(target_id, _build_click_card_script(int(card_index)))
                                 )
+                                if clicked.get("ok") is not True:
+                                    # 卡片懒加载或列表重渲染时可能瞬时未命中，重试后再判定结构变化
+                                    for _ in range(2):
+                                        self.sleep(1.5)
+                                        self.browser.scroll(target_id, y=2600)
+                                        clicked = self._parse_payload(
+                                            self.browser.evaluate(target_id, _build_click_card_script(int(card_index)))
+                                        )
+                                        if clicked.get("ok") is True:
+                                            break
                                 if clicked.get("ok") is not True:
                                     return PlatformCollectionResult(
                                         self.platform, "blocked", "selector_changed", "智联职位卡结构变化，已安全停止"
@@ -1396,7 +1457,13 @@ class ZhilianCollector:
                             candidate = self._candidate_from_list(raw_item, city, keyword)
                             if candidate is None:
                                 continue
-                            if not self._passes_filters(candidate):
+                            salary_reason = self._salary_block_reason(candidate)
+                            if salary_reason:
+                                hooks.on_event(message=f"智联 列表预筛：{salary_reason}", increment_filtered=True, filtered_candidate=candidate)
+                                continue
+                            filter_reason = self._filter_reason(candidate)
+                            if filter_reason:
+                                hooks.on_event(message=filter_reason, increment_filtered=True, filtered_candidate=candidate)
                                 continue
                             if not hooks.on_list_candidate(candidate):
                                 continue
@@ -1461,11 +1528,22 @@ class ZhilianCollector:
                 finally:
                     if target_id:
                         self.browser.close_tab(target_id)
-                # 词结束：标记词级断点 + 清页级断点
+                # 词结束：标记词级断点；页级断点保留（空页时已推进到上限页），到期自动失效
                 if self.safety_conn is not None:
                     mark_combo_collected(self.safety_conn, "zhilian", city, keyword)
-                    delete_page_progress(self.safety_conn, "zhilian", city, keyword)
-        return PlatformCollectionResult(self.platform, "completed", "search_exhausted", "智联搜索结果已采集完毕")
+                outcomes["resumed" if saved_page > 0 else "scanned"] += 1
+        if outcomes["skipped"] and outcomes["skipped"] == total_combos:
+            return PlatformCollectionResult(
+                self.platform, "completed", "no_remaining_pages",
+                f"智联 上次已采到设定的最大页，{self._resume_ttl_hours()} 小时内没有剩余页可采；"
+                f"如需从第 1 页重扫，请在采集设置里勾选「从第 1 页重扫」",
+            )
+        message = "智联搜索结果已采集完毕"
+        if outcomes["resumed"]:
+            message += f"；{outcomes['resumed']} 个组合从上次页码续采"
+        if outcomes["skipped"]:
+            message += f"；{outcomes['skipped']} 个组合 24h 内已采完、无剩余页"
+        return PlatformCollectionResult(self.platform, "completed", "search_exhausted", message)
 
     @staticmethod
     def _candidate_from_list(raw: Any, city: str, keyword: str) -> JobCandidate | None:

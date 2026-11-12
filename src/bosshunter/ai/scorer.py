@@ -362,10 +362,10 @@ def _structured_score_result(result: dict, *, reviewed: bool = False) -> ScoreRe
     if not isinstance(raw_caps, list):
         return None
     caps = tuple(dict.fromkeys(str(cap) for cap in raw_caps if str(cap) in CAP_LIMITS))
-    summary_reason = str(result.get("reason") or "").strip()
+    summary_reason = _normalize_short_text(result.get("reason"), SUMMARY_REASON_LIMIT)
     if not summary_reason:
         return None
-    missing = str(result.get("missing") or "").strip()
+    missing = _normalize_short_text(result.get("missing"), MISSING_LIMIT)
     role_summary = _normalize_short_text(result.get("role_summary"), ROLE_SUMMARY_LIMIT)
     hard_gaps = _normalize_short_strings(
         result.get("hard_gaps"),
@@ -406,12 +406,18 @@ def _apply_field_aliases(result: dict) -> dict:
 def _validated_score_result(text: str) -> ScoreResult | None:
     """Accept only complete structured evidence scores."""
     result = _parse_score_response(text)
-    if not isinstance(result, dict):
+    return validate_structured_score_payload(result)
+
+
+def validate_structured_score_payload(value: object, *, reviewed: bool = False) -> ScoreResult | None:
+    """Validate a structured score supplied by a local Agent or an AI provider."""
+    if not isinstance(value, dict):
         return None
+    result = dict(value)
     _apply_field_aliases(result)
-    if all(key in result for key in COMPONENT_LIMITS):
-        return _structured_score_result(result)
-    return None
+    if not all(key in result for key in COMPONENT_LIMITS):
+        return None
+    return _structured_score_result(result, reviewed=reviewed)
 
 
 def _score_validation_failure_reason(text: str | None) -> str:
@@ -691,7 +697,7 @@ def _request_score(
         try:
             response = _call_claude(_build_scoring_prompt(job, resume, config), config)
         except AIRequestError as retry_exc:
-            if retry_exc.kind in {"token_quota", "rate_limit", "auth", "network", "request_failed"}:
+            if retry_exc.kind in {"token_quota", "rate_limit", "auth", "network", "request_failed", "model_not_found"}:
                 return ScoreOutcome(pause_reason=str(retry_exc))
             response = None
         result = _validated_score_result(response) if response else None
@@ -721,7 +727,7 @@ def _score_job_with_ai(
     try:
         response = _call_claude(_build_review_prompt(job, resume, first, config), config)
     except AIRequestError as exc:
-        if exc.kind in {"token_quota", "rate_limit", "auth", "network", "request_failed"}:
+        if exc.kind in {"token_quota", "rate_limit", "auth", "network", "request_failed", "model_not_found"}:
             return ScoreOutcome(result=first, pause_reason=str(exc))
         _notify(config, f"{job['company']}｜{job['title']} 二次复核未完成，保留第一次评分。")
         return outcome
@@ -766,6 +772,7 @@ def score_jobs(
 
         threshold = config.get("scoring", {}).get("threshold", 60)
         remaining_job_ids = [str(job["id"]) for job in pending_jobs]
+        _report_progress(config, 0, len(pending_jobs), 0, 0, 0)
         _report_checkpoint(config, remaining_job_ids, status="running")
 
         def mark_completed(job_id: str) -> None:
@@ -805,7 +812,6 @@ def score_jobs(
                     filtered += 1
                     prefiltered += 1
                     processed += 1
-                    mark_completed(str(job["id"]))
                     progress.update(
                         task,
                         advance=1,
@@ -819,6 +825,7 @@ def score_jobs(
                         filtered,
                         failed,
                     )
+                    mark_completed(str(job["id"]))
                 else:
                     ai_jobs.append(job)
 
@@ -894,13 +901,13 @@ def score_jobs(
 
                     if completed_job:
                         processed += 1
-                        mark_completed(str(job["id"]))
                         progress.update(
                             task,
                             advance=1,
                             description=f"评分中 ({processed}/{len(pending_jobs)}) [预筛淘汰{prefiltered}]",
                         )
                         _report_progress(config, processed, len(pending_jobs), scored, filtered, failed)
+                        mark_completed(str(job["id"]))
 
                     if outcome.pause_reason:
                         pause_reason = outcome.pause_reason

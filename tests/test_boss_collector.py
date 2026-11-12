@@ -1,6 +1,7 @@
 import json
 import re
 import tempfile
+from contextlib import closing
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from unittest import TestCase
@@ -15,6 +16,7 @@ from bosshunter.collection.platforms.boss import (
     JS_DETECT_COLLECTION_RISK,
     JS_EXTRACT_DETAIL,
     JS_EXTRACT_LIST,
+    JS_SEARCH_READY,
     SEARCH_URL,
     BossBrowser,
     BossCollector,
@@ -167,6 +169,8 @@ class BossCollectorCollectionTests(TestCase):
                 return risk_raw
             if script == JS_EXTRACT_LIST:
                 return json.dumps(list_jobs)
+            if script == JS_SEARCH_READY:
+                return True
             if script == JS_EXTRACT_DETAIL:
                 return json.dumps(detail)
             return "{}"
@@ -194,6 +198,43 @@ class BossCollectorCollectionTests(TestCase):
         throttle = MagicMock()
         throttle.wait.return_value = False
         return throttle
+
+    def test_collection_window_blocks_single_collection(self):
+        browser = self._make_browser()
+        hooks, _ = self._make_hooks()
+        collector = BossCollector(
+            browser=browser,
+            throttle_factory=lambda **_kw: self._make_throttle(),
+            config={
+                "throttle": {"send_windows": ["08:30-12:30", "13:30-18:30"]},
+                "collection": {"collect_windows": ["06:00-11:30", "13:30-22:30"]},
+            },
+        )
+        with patch("bosshunter.collection.platforms.boss.SendWindowChecker") as checker:
+            checker.return_value.is_active.return_value = False
+            result = collector.collect(
+                PlatformCollectionRequest("boss", ["AI"], ["北京"], {"北京": "101010100"}, max_pages=1),
+                hooks,
+            )
+        checker.assert_called_once_with(["06:00-11:30", "13:30-22:30"])
+        self.assertEqual(result.reason_code, "outside_window")
+        self.assertEqual(result.status, "completed")
+
+    def test_collection_session_skips_window_check(self):
+        browser = self._make_browser()
+        hooks, _ = self._make_hooks()
+        collector = BossCollector(
+            browser=browser,
+            throttle_factory=lambda **_kw: self._make_throttle(),
+            config={"_collection_session_id": "night-session"},
+        )
+        with patch("bosshunter.collection.platforms.boss.SendWindowChecker") as checker:
+            result = collector.collect(
+                PlatformCollectionRequest("boss", ["AI"], ["未知城市"], {}, max_pages=1),
+                hooks,
+            )
+        checker.assert_not_called()
+        self.assertEqual(result.reason_code, "no_valid_city")
 
     def test_no_valid_city_returns_shortage(self):
         browser = self._make_browser()
@@ -261,7 +302,7 @@ class BossCollectorCollectionTests(TestCase):
             hooks,
         )
         self.assertEqual(result.status, "completed_with_shortage")
-        self.assertEqual(result.reason_code, "no_jobs_extracted")
+        self.assertEqual(result.reason_code, "no_jobs_for_search")
         self.assertNotIn("已采集完毕", result.message)
 
     def test_collection_extracts_candidates(self):
@@ -571,9 +612,7 @@ class BossFreshSearchTests(TestCase):
 
     def test_empty_or_failed_search_is_not_checkpointed(self):
         for raw in ("[]", None, "not-json", '[{"title": "missing URL"}]'):
-            with self.subTest(raw=raw), tempfile.TemporaryDirectory() as tmp:
-                conn = get_db(Path(tmp) / "jobs.db")
-                self.addCleanup(conn.close)
+            with self.subTest(raw=raw), tempfile.TemporaryDirectory() as tmp, closing(get_db(Path(tmp) / "jobs.db")) as conn:
                 browser = self._make_browser()
                 original_evaluate = browser.evaluate
                 browser.evaluate = lambda target, script: (
@@ -586,7 +625,9 @@ class BossFreshSearchTests(TestCase):
                 ).collect(
                     PlatformCollectionRequest("boss", ["AI"], ["北京"], {}, max_pages=1), hooks,
                 )
-                self.assertEqual(result.status, "completed_with_shortage")
+                self.assertEqual(result.status, "failed" if raw == "[]" else "completed_with_shortage")
+                if raw == "[]":
+                    self.assertEqual(result.reason_code, "list_load_unconfirmed")
                 self.assertEqual(collected, [])
                 self.assertEqual(get_collected_combos(conn, "boss"), set())
                 self.assertEqual(get_page_progress(conn, "boss", "北京", "AI"), 0)
@@ -805,3 +846,100 @@ class BossEdgeCaseTests(TestCase):
         )
         self.assertEqual(result.status, "stopped")
         self.assertEqual(result.reason_code, "user_stopped")
+
+
+class BossDetailScriptTests(TestCase):
+    def test_detail_script_reads_hr_card_before_company_attr(self):
+        """HR name and status live in .job-boss-info; .boss-info-attr only has company and title."""
+        from bosshunter.collection.platforms.boss import JS_EXTRACT_DETAIL
+
+        self.assertIn(".job-boss-info", JS_EXTRACT_DETAIL)
+        self.assertIn(".boss-online-tag", JS_EXTRACT_DETAIL)
+        self.assertIn("boss-active-time", JS_EXTRACT_DETAIL)
+        self.assertLess(JS_EXTRACT_DETAIL.index("const bossCard"), JS_EXTRACT_DETAIL.index("const bossAttr"))
+
+    def test_activity_pattern_is_shared_by_extraction_and_name_cleanup(self):
+        from bosshunter.collection.platforms.boss import HR_ACTIVE_PATTERN, JS_EXTRACT_DETAIL
+
+        self.assertNotIn("__HR_ACTIVE_PATTERN__", JS_EXTRACT_DETAIL)
+        self.assertEqual(JS_EXTRACT_DETAIL.count(HR_ACTIVE_PATTERN), 2)
+
+    def test_activity_pattern_covers_every_card_label(self):
+        import re
+
+        from bosshunter.collection.platforms.boss import HR_ACTIVE_PATTERN
+
+        labels = [
+            "在线", "刚刚活跃", "今日活跃", "本周活跃", "本月活跃", "半年前活跃",
+            "3日内活跃", "3天内活跃", "两天内活跃", "2周内活跃", "二周内活跃", "2月内活跃", "3个月内活跃", "十天内活跃",
+        ]
+        for label in labels:
+            with self.subTest(label=label):
+                self.assertIsNotNone(re.fullmatch(HR_ACTIVE_PATTERN, label))
+
+    def _run_detail_script(self, *, name_text, name_children="", card_text, active_node="", online_tag=""):
+        """Run JS_EXTRACT_DETAIL in node against a hand-built BOSS HR card (same node shape as the page)."""
+        import json
+        import shutil
+        import subprocess
+
+        from bosshunter.collection.platforms.boss import JS_EXTRACT_DETAIL
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        harness = """
+const [script, cfg] = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+const textNode = (t) => ({nodeType: 3, textContent: t});
+const nameNode = {firstChild: textNode(cfg.nameText), textContent: cfg.nameText + cfg.nameChildren};
+const bossCard = {innerText: cfg.cardText, querySelector: (s) => (s === '.name' ? nameNode : null)};
+const bossAttr = {innerText: '某公司 · 招聘者', querySelector: () => null};
+const nodes = {
+  '.job-boss-info': bossCard,
+  '.boss-info-attr': bossAttr,
+  '.boss-active-time': cfg.activeNode ? {textContent: cfg.activeNode} : null,
+  '.boss-online-tag': cfg.onlineTag ? {textContent: cfg.onlineTag} : null,
+};
+const document = {
+  title: 'x_某公司招聘',
+  querySelector: (s) => nodes[s] || null,
+  querySelectorAll: () => [],
+};
+const window = {location: {pathname: '/job_detail/x.html'}};
+console.log(eval(script));
+"""
+        payload = json.dumps([JS_EXTRACT_DETAIL, {
+            "nameText": name_text, "nameChildren": name_children, "cardText": card_text,
+            "activeNode": active_node, "onlineTag": online_tag,
+        }])
+        # 本地定制：node 收发的是 UTF-8，Windows 上 text=True 会按 cp936 解码并直接吞掉 stdout。
+        proc = subprocess.run(
+            [node, "-e", harness], input=payload, capture_output=True, text=True, encoding="utf-8", timeout=30
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_multi_day_activity_labels_reach_hr_active(self):
+        for label in ["3日内活跃", "3天内活跃", "两天内活跃", "2周内活跃", "2月内活跃", "3个月内活跃", "半年前活跃"]:
+            with self.subTest(label=label):
+                info = self._run_detail_script(
+                    name_text="张经理", name_children=label, card_text=f"张经理{label}\n招聘者",
+                )
+                self.assertEqual(info["hr_active"], label)
+                self.assertEqual(info["hr_name"], "张经理")
+                self.assertEqual(info["hr_title"], "招聘者")
+
+    def test_online_tag_and_active_time_node_are_preferred(self):
+        info = self._run_detail_script(
+            name_text="陈雪莉", name_children="在线", card_text="陈雪莉在线\nhrbp", online_tag="在线",
+        )
+        self.assertEqual(info["hr_active"], "在线")
+        info = self._run_detail_script(
+            name_text="李女士", card_text="李女士\nHR", active_node="本周活跃",
+        )
+        self.assertEqual(info["hr_active"], "本周活跃")
+
+    def test_card_without_status_leaves_hr_active_empty(self):
+        info = self._run_detail_script(name_text="冯先生", card_text="冯先生\nHR")
+        self.assertEqual(info["hr_active"], "")
+        self.assertEqual(info["hr_name"], "冯先生")

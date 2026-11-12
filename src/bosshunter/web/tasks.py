@@ -9,6 +9,8 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from bosshunter.throttle import SendWindowChecker
+from bosshunter.browser.ownership import browser_execution
+from contextlib import nullcontext
 
 
 MODE_LABELS = {
@@ -16,6 +18,7 @@ MODE_LABELS = {
     "collect": "单独采集",
     "score": "单独 AI 评分",
     "rescore": "重新评分",
+    "greet": "生成招呼语",
     "monitor": "单独监测",
     "deliver": "确认投递",
 }
@@ -158,6 +161,12 @@ class WorkbenchTaskRunner:
                 raise KeyError(task_id)
             if task.status in TERMINAL_STATUSES:
                 return task.snapshot()
+            persist_stop = task.context.get("persist_stop")
+            if callable(persist_stop):
+                try:
+                    persist_stop()
+                finally:
+                    task.stop_requested.set()
             task.stop_requested.set()
             task.status = "stopping"
             task.stop_reason = reason
@@ -181,7 +190,8 @@ class WorkbenchTaskRunner:
         try:
             executor = self._executors.get(task.mode)
             if executor:
-                executor(task, config)
+                with browser_execution() if task.mode in {"full", "collect", "monitor", "deliver"} else nullcontext():
+                    executor(task, config)
             with self._lock:
                 if task.stop_requested.is_set():
                     task.status = "stopped"
@@ -221,7 +231,5 @@ def _deadline_from_config(mode: str, config: dict) -> datetime | None:
     if mode not in DEADLINE_MODES:
         return None
     throttle = config.get("throttle", {}) if isinstance(config, dict) else {}
-    windows = throttle.get("send_windows", [])
-    if not isinstance(windows, list):
-        return None
+    windows = throttle.get("send_windows", ["09:00-16:00"])
     return SendWindowChecker(windows).latest_end_datetime()

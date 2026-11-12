@@ -25,17 +25,52 @@ class AiPreflightTests(unittest.TestCase):
 		self.assertIn("API Key 验证失败", checks[0]["message"])
 		self.assertNotIn("secret-key", str(checks))
 
+	@patch("bosshunter.web.preflight.call_anthropic_text", return_value="OK")
 	@patch("bosshunter.web.preflight.httpx.get")
-	def test_valid_api_connection_returns_pass(self, http_get):
-		http_get.return_value = Mock(status_code=200)
+	def test_valid_api_connection_returns_pass(self, http_get, generate):
+		http_get.return_value = Mock(
+			status_code=200,
+			json=Mock(return_value={"data": [{"id": "claude-sonnet-4-6"}]}),
+		)
 		config = {"ai": {"api_key": "secret-key", "model": "claude-sonnet-4-6"}}
 
 		checks = check_ai_connection(config, required=True)
 
 		self.assertEqual(checks[0]["status"], "pass")
 		self.assertIn("连接正常", checks[0]["message"])
+		self.assertIn("已发送一条最小生成请求", checks[0]["detail"])
 		http_get.assert_called_once()
 		self.assertFalse(http_get.call_args.kwargs["trust_env"])
+		generate.assert_called_once()
+
+	@patch("bosshunter.web.preflight.call_anthropic_text")
+	@patch("bosshunter.web.preflight.httpx.get")
+	def test_listed_model_that_cannot_generate_is_an_error(self, http_get, generate):
+		"""模型列表里有该 ID，但生成接口返回 404 时不得显示连接正常。"""
+		from bosshunter.ai.credentials import AIRequestError
+
+		http_get.return_value = Mock(
+			status_code=200,
+			json=Mock(return_value={"data": [{"id": "u2-flash"}, {"id": "u2-med"}]}),
+		)
+		generate.side_effect = AIRequestError("model_not_found", "AI 模型不存在", 404)
+		config = {
+			"ai": {
+				"provider": "openai_compatible",
+				"service": "custom",
+				"base_url": "https://gateway.example/v1",
+				"api_key": "secret-key",
+				"model": "u2-flash",
+			}
+		}
+
+		checks = check_ai_connection(config, required=True)
+
+		self.assertEqual(checks[0]["id"], "ai_model")
+		self.assertEqual(checks[0]["status"], "error")
+		self.assertIn("u2-flash", checks[0]["message"])
+		self.assertIn("u2-med", checks[0]["detail"])
+		self.assertNotIn("secret-key", str(checks))
 
 	def test_openai_compatible_provider_requires_base_url(self):
 		config = {
@@ -81,10 +116,14 @@ class AiPreflightTests(unittest.TestCase):
 
 	@patch("bosshunter.web.preflight.sys.version", "3.13.0a5 (test build)")
 	@patch("bosshunter.web.preflight.sys.version_info", Mock(releaselevel="alpha"))
+	@patch("bosshunter.web.preflight.call_anthropic_text", return_value="OK")
 	@patch("bosshunter.web.preflight.httpx.get")
-	def test_prerelease_python_adds_runtime_warning(self, http_get):
+	def test_prerelease_python_adds_runtime_warning(self, http_get, generate):
 		"""预发布 Python 可能存在依赖兼容风险，连接成功时也应明确警告。"""
-		http_get.return_value = Mock(status_code=200)
+		http_get.return_value = Mock(
+			status_code=200,
+			json=Mock(return_value={"data": [{"id": "claude-sonnet-4-6"}]}),
+		)
 		config = {"ai": {"api_key": "secret-key", "model": "claude-sonnet-4-6"}}
 
 		checks = check_ai_connection(config, required=True)

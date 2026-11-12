@@ -33,12 +33,11 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
 
+from bosshunter.ai.prefilter import salary_filter_result
 from bosshunter.browser import close_tab, evaluate, get_page_targets, new_tab
 from bosshunter.collection.base import CollectionBlockedError, CollectorHooks
 from bosshunter.collection.models import JobCandidate, PlatformCollectionRequest, PlatformCollectionResult
 from bosshunter.db import (
-    delete_page_progress,
-    get_collected_combos,
     get_page_progress,
     job_identity_exists,
     mark_combo_collected,
@@ -47,12 +46,15 @@ from bosshunter.db import (
     upsert_page_progress,
 )
 from bosshunter.job_filters import matching_blocked_company, matching_deal_breaker
-from bosshunter.throttle import SendWindowChecker, should_take_day_off
+from bosshunter.throttle import resolve_collection_windows, SendWindowChecker, should_take_day_off
 
 
 SEARCH_URL = "https://we.51job.com/pc/search?jobArea={area}&keyword={keyword}"
 API_SEARCH_URL = "https://we.51job.com/api/job/search-pc"
 API_PAGE_SIZE = 20        # 每页条数（API 上限 20，实测稳定）
+# 接口调用返回空时的兜底阶梯：(等待秒数, 是否先降频)。前两次只是等一等再问；后两次先把采集节奏放慢一档再问；
+# 全部用完仍为空才按 L3 处理。真正的风控信号（HTML/状态码/风控词）不走这里，仍然直接停。
+EMPTY_RESULT_RECOVERY = ((8, False), (20, False), (60, True), (180, True))
 API_FETCH_TIMEOUT = 25.0  # 单次 fetch 超时（秒）
 
 # ---- 速率四层防护（共享一个 60s 窗口，堵「多阶段独立计数叠加」漏洞）----
@@ -129,7 +131,7 @@ _GENERIC_ROLE_WORDS = [
     "工程师", "管理员", "顾问", "助理", "实习生", "管培生", "培训生",
     "专家", "主任", "副总裁", "总裁", "高级", "资深", "初级", "中级", "师",
 ]
-_INTERNSHIP_TITLE_TERMS = ("实习", "intern", "internship", "管培")
+_INTERNSHIP_TITLE_TERMS = ("实习", "intern", "internship")  # 本地定制：管培不算实习
 
 
 # 城市快照从 JSON 数据文件加载（160 城市已核验编码）。
@@ -289,30 +291,25 @@ def _is_relevant_to_keyword(title: str, jd: str, kw: str) -> bool:
         if core_l.isascii() and any(c.isalpha() for c in core_l):
             if re.search(rf"(?<![a-z0-9]){re.escape(core_l)}(?![a-z0-9])", t):
                 return True
-        elif core_l in t:
+        elif core_l in re.sub(r"\s+", "", t):
             return True
     return False
 
 
 def _is_internship(title: str, experience: str) -> bool:
-    """判断岗位是否为实习/管培（只查标题，experience 的「无需经验」会误伤 entry-level）。"""
+    """判断岗位是否为实习（只查标题，管培不算；experience 的「无需经验」会误伤 entry-level）。"""
     t = (title or "").lower()
     return any(s in t for s in _INTERNSHIP_TITLE_TERMS)
 
 
-def _salary_within_range(salary: str, salary_min: float, salary_max: float) -> bool:
-    """薪资过滤：仅当薪资能解析出区间才对边界做校验（解析失败放行，不误伤）。"""
-    if salary_min <= 0 and salary_max <= 0:
-        return True
-    rng = _parse_salary_range(salary)
-    if rng is None:
-        return True
-    lo, hi = rng
-    if salary_min > 0 and lo < salary_min:
-        return False
-    if salary_max > 0 and hi > salary_max:
-        return False
-    return True
+def _salary_within_range(
+    salary: str, salary_min: float, salary_max: float, profile: dict | None = None,
+) -> bool:
+    """Use the shared salary gate for probes and the final collection pass."""
+    score, _ = salary_filter_result(salary, {
+        **(profile or {}), "salary_min": salary_min, "salary_max": salary_max,
+    })
+    return score > 0
 
 
 def _analyze_api_response(http_status: int, content_type: str, body: str) -> dict:
@@ -421,6 +418,12 @@ class _ApiRateLimiter:
             self._gap_range = (5.0, 8.0)
             self._break_range = (90.0, 180.0)
             self._per_min_limit = 12
+
+    def slow_down(self) -> None:
+        """Back off after the platform stops answering: double the gaps and breaks, halve the per-minute cap."""
+        self._gap_range = tuple(v * 2 for v in self._gap_range)
+        self._break_range = tuple(v * 2 for v in self._break_range)
+        self._per_min_limit = max(4, self._per_min_limit // 2)
 
     def set_tier(self, total_requests: int) -> None:
         self._set_tier(total_requests)
@@ -552,11 +555,15 @@ class Job51Collector:
         if not _is_relevant_to_keyword(candidate.title, candidate.jd, kw):
             return False
         # collector 增值层：薪资范围
-        if not _salary_within_range(candidate.salary, salary_min, salary_max):
+        if not _salary_within_range(candidate.salary, salary_min, salary_max, self.config.get("profile")):
             return False
         return True
 
-    def _passes_collector_filters(
+    def _passes_collector_filters(self, candidate, kw, *, allow_internship, salary_min, salary_max) -> bool:
+        return not self._collector_filter_reason(candidate, kw, allow_internship=allow_internship,
+                                                 salary_min=salary_min, salary_max=salary_max)
+
+    def _collector_filter_reason(
         self,
         candidate: JobCandidate,
         kw: str,
@@ -564,19 +571,19 @@ class Job51Collector:
         allow_internship: bool,
         salary_min: float,
         salary_max: float,
-    ) -> bool:
+    ) -> str:
         """正式入库阶段 collector 自己做的那部分过滤（官方不重复的增值层）。
 
         deal_breakers / blocked_company / jd_deal_breakers 在正式入库时交给官方
         ``_SharedProcessor`` 的 hooks 回调处理，这里只做官方没有的增值过滤。
         """
         if not allow_internship and _is_internship(candidate.title, candidate.experience):
-            return False
+            return "当前设置不接受实习岗位"
         if not _is_relevant_to_keyword(candidate.title, candidate.jd, kw):
-            return False
-        if not _salary_within_range(candidate.salary, salary_min, salary_max):
-            return False
-        return True
+            return "职位与搜索关键词不相关"
+        if not _salary_within_range(candidate.salary, salary_min, salary_max, self.config.get("profile")):
+            return "薪资不符合设置范围"
+        return ""
 
     @staticmethod
     def _item_to_candidate(
@@ -644,10 +651,27 @@ class Job51Collector:
         self.sleep(5)  # 等宿主页加载出 cookie
         return host_target, True
 
+    def _note_recovery(self, message: str) -> None:
+        hooks = getattr(self, "_hooks", None)
+        if hooks is not None:
+            self._log(hooks, message, phase="procuring")
+
     def _fetch_page(self, host_target: str, kw_encoded: str, area: str, page: int) -> dict:
         """在宿主页上下文发一次 API 请求并分析返回，返回 _analyze_api_response 结果。"""
         js = JS_FETCH_API_PAGE.replace("__KW__", kw_encoded).replace("__AREA__", area).replace("__PAGE__", str(page))
         raw = self.browser.evaluate(host_target, js, timeout=API_FETCH_TIMEOUT)
+        # An empty answer is usually a stalled tab or a dropped CDP call, not risk control. Climb down the ladder
+        # (wait, wait longer, slow the collection rhythm and wait, slow it again) before treating it as an L3 stop
+        # that ends the whole platform.
+        for wait, slow in EMPTY_RESULT_RECOVERY:
+            if raw is not None:
+                break
+            limiter = getattr(self, "_limiter", None)
+            if slow and limiter is not None:
+                limiter.slow_down()
+            self._note_recovery(f"51job 接口无响应，{'已降低采集频率，' if slow else ''}等待 {wait} 秒后重试")
+            self.sleep(wait)
+            raw = self.browser.evaluate(host_target, js, timeout=API_FETCH_TIMEOUT)
         if raw is None:
             return {"ok": False, "level": 3, "signal": "empty_result",
                     "note": "evaluate 返回空（超时/断连）", "jobs": [], "total": 0}
@@ -686,24 +710,19 @@ class Job51Collector:
                 return PlatformCollectionResult(self.platform, "failed", "no_valid_city",
                                                 f"51job 城市编码未配置：{city}")
 
-        # 词级断点续采：跳过最近 N 小时内已完成的 (city, keyword) 组合。
-        # 超过有效期（默认 24h）的旧断点视为过期，重新采集（招聘岗位每天都有新增）。
-        # 孤儿断点（关键词被增删后残留）顺带清理，避免脏数据累积。
-        collected_combos: set[tuple[str, str]] = set()
+        # 页级断点续采：只跳过「已采到最大页」的词，未采满的词从上次页码的下一页继续。
+        # 超过有效期（默认 24h）的旧断点视为过期，下次从第 1 页重新采集（招聘岗位每天都有新增）。
         if self.safety_conn is not None:
             all_keywords = set(request.keywords)
             prune_collected_combos(self.safety_conn, "51job", all_keywords)
             prune_page_progress(self.safety_conn, "51job", all_keywords)
-            collected_combos = get_collected_combos(
-                self.safety_conn, "51job", within_hours=self._resume_ttl_hours()
-            )
 
-        # 反检测前置：时间窗口 + 随机休息日（复用 BossHunter throttle 配置）
-        throttle_cfg = self.config.get("throttle", {}) if isinstance(self.config.get("throttle"), dict) else {}
-        send_windows = throttle_cfg.get("send_windows", ["09:00-16:00"])
-        if not SendWindowChecker(send_windows).is_active():
+        # 采集专属时间窗口；未配置时兼容旧版发送窗口。
+        collect_windows = resolve_collection_windows(self.config)
+        if not SendWindowChecker(collect_windows).is_active():
             return PlatformCollectionResult(self.platform, "completed", "outside_window",
-                                            f"当前不在采集时间窗口内（{send_windows}）")
+                                            f"当前不在采集时间窗口内（{collect_windows}）")
+        throttle_cfg = self.config.get("throttle", {}) if isinstance(self.config.get("throttle"), dict) else {}
         if should_take_day_off(float(throttle_cfg.get("day_off_probability", 0.05))):
             return PlatformCollectionResult(self.platform, "completed", "day_off",
                                             "今日随机休息，跳过 51job 采集")
@@ -730,31 +749,45 @@ class Job51Collector:
 
         # ★ 全局限速器：探针/保底针/热区扫描三阶段共享同一个 60s 窗口，统一计数。
         rate_limiter = _ApiRateLimiter(total_requests=API_ADAPTIVE_MEDIUM, no_burst=False)
+        self._limiter, self._hooks = rate_limiter, hooks
 
+        total_combos = len(request.cities) * len(request.keywords)
+        outcomes = {"scanned": 0, "resumed": 0, "skipped": 0, "saturated": 0}
         try:
             for city in request.cities:
                 area = str(request.city_codes.get(city) or "").strip()
                 for kw in request.keywords:
                     if hooks.stop_event is not None and hooks.stop_event.is_set():
                         return PlatformCollectionResult(self.platform, "stopped", "user_stopped", "用户已停止")
-                    # 词级断点跳过：24h 内已完成的组合整词跳过
-                    if (city, kw) in collected_combos:
-                        self._log(hooks, f"51job {kw} 断点续采：24h 内已完成，整词跳过",
-                                  phase="completed_keyword", keyword=kw, city=city)
-                        continue
-                    self._collect_keyword(
+                    status = self._collect_keyword(
                         request, hooks, host_target, rate_limiter,
                         city=city, area=area, kw=kw, max_pages=max_pages,
                         deal_breakers=deal_breakers, jd_deal_breakers=jd_deal_breakers,
                         blocked_companies=blocked_companies, allow_internship=allow_internship,
                         salary_min=salary_min, salary_max=salary_max,
                     )
+                    if status in outcomes:
+                        outcomes[status] += 1
+                    if status == "skipped":
+                        self._log(hooks, f"51job {kw} 已采到最大页，{self._resume_ttl_hours()}h 内无剩余页，跳过本词",
+                                  phase="completed_keyword", keyword=kw, city=city,
+                                  skipped=outcomes["skipped"])
         finally:
             if owns_host_target:
                 self.browser.close_tab(host_target)
 
-        return PlatformCollectionResult(self.platform, "completed", "search_exhausted",
-                                        "51job 搜索结果已采集完毕")
+        if outcomes["skipped"] and outcomes["skipped"] == total_combos:
+            return PlatformCollectionResult(
+                self.platform, "completed", "no_remaining_pages",
+                f"51job 上次已采到设定的最大页，{self._resume_ttl_hours()} 小时内没有剩余页可采；"
+                f"如需从第 1 页重扫，请在采集设置里勾选「从第 1 页重扫」",
+            )
+        message = "51job 搜索结果已采集完毕"
+        if outcomes["resumed"]:
+            message += f"；{outcomes['resumed']} 个组合从上次页码续采"
+        if outcomes["skipped"]:
+            message += f"；{outcomes['skipped']} 个组合 24h 内已采完、无剩余页"
+        return PlatformCollectionResult(self.platform, "completed", "search_exhausted", message)
 
     def _collect_keyword(
         self,
@@ -773,21 +806,25 @@ class Job51Collector:
         allow_internship: bool,
         salary_min: float,
         salary_max: float,
-    ) -> None:
-        """单个 (城市, 关键词) 的完整闭环：探针 → 保底针 → 饱和跳过 / 热区扫描。"""
+    ) -> str | None:
+        """单个 (城市, 关键词) 的完整闭环：探针 → 保底针 → 饱和跳过 / 热区扫描。
+
+        返回 scanned / resumed / skipped / saturated，供上层统计续采与跳过数量。
+        """
         kw_encoded = quote(kw)
 
-        # 页级断点续采：读上次采到页码，从 N+1 页继续（中途停止→续采不重翻）
-        saved_page = get_page_progress(self.safety_conn, "51job", city, kw) if self.safety_conn is not None else 0
+        # 页级断点续采：读上次采到页码，从 N+1 页继续（中途停止/调大页数→续采不重翻）
+        saved_page = 0
+        if self.safety_conn is not None and not request.ignore_checkpoint:
+            saved_page = get_page_progress(
+                self.safety_conn, "51job", city, kw, within_hours=self._resume_ttl_hours()
+            )
         start_page = saved_page + 1 if saved_page > 0 else 1
-        # 边界守卫：续采起点已超过最大页（理论上该词已采完），直接标记完成并跳过
+        # 边界守卫：续采起点已超过最大页（该词在有效期内已采满），跳过本词
         if start_page > max_pages:
             if self.safety_conn is not None:
                 mark_combo_collected(self.safety_conn, "51job", city, kw)
-                delete_page_progress(self.safety_conn, "51job", city, kw)
-            self._log(hooks, f"51job {kw} 页级断点已超最大页（{saved_page}/{max_pages}），视为已采完，跳过",
-                      phase="completed_keyword", keyword=kw, city=city)
-            return
+            return "skipped"
         self._log(hooks, f"51job {kw} 采集（共 {max_pages} 页" + (f"，从第 {start_page} 页续采" if saved_page > 0 else "") + "）",
                   phase="loading_list", keyword=kw, city=city)
 
@@ -906,14 +943,14 @@ class Job51Collector:
                     hot_pages.update(range(max(1, fp - 3), min(effective_max, fp + 3) + 1))
                     probe_hits.append(f"p{fp}(+{fp_new})")
 
-        # 探针全空 → 饱和，整词跳过（记词级断点 + 清页级断点，避免下次重复探测）
+        # 探针全空 → 饱和：把断点记到有效末页，避免下次重复探测（页级断点保留，到期自动失效）
         if not hot_pages:
             if self.safety_conn is not None:
                 mark_combo_collected(self.safety_conn, "51job", city, kw)
-                delete_page_progress(self.safety_conn, "51job", city, kw)
+                upsert_page_progress(self.safety_conn, "51job", city, kw, effective_max)
             self._log(hooks, f"51job {kw} 分布式探针全空（已饱和）：命中 {probe_hits or '无'}，跳过 {effective_max} 页",
                       phase="completed_keyword", keyword=kw, city=city)
-            return
+            return "saturated"
 
         # ★ 随机插一针（兜底抽查）：从非热区页随机挑 1 页加入热区，防热区外扩不足
         non_hot = [p for p in range(1, effective_max + 1) if p not in hot_pages]
@@ -953,6 +990,9 @@ class Job51Collector:
                 if analysis.get("signal") == "empty_items" and page > 1:
                     self._log(hooks, f"51job {kw} 已到末页（第 {page} 页为空），结束本词",
                               phase="loading_list", keyword=kw, city=city, page=page)
+                    # 本词已无更多结果：断点推进到上限页，下次直接跳过本词
+                    if self.safety_conn is not None:
+                        upsert_page_progress(self.safety_conn, "51job", city, kw, max_pages)
                     break
                 raise CollectionBlockedError(
                     _reason_code_for(analysis),
@@ -968,8 +1008,10 @@ class Job51Collector:
                 if cand is None:
                     continue
                 # collector 增值层过滤（官方无：实习 / 相关性 / 薪资）
-                if not self._passes_collector_filters(cand, kw, allow_internship=allow_internship,
-                                                      salary_min=salary_min, salary_max=salary_max):
+                filter_reason = self._collector_filter_reason(cand, kw, allow_internship=allow_internship,
+                                                             salary_min=salary_min, salary_max=salary_max)
+                if filter_reason:
+                    hooks.on_event(message=filter_reason, increment_filtered=True, filtered_candidate=cand)
                     continue
                 # 官方统一层：去重 + title deal_breakers + blocked_company
                 if not hooks.on_list_candidate(cand):
@@ -986,12 +1028,15 @@ class Job51Collector:
             if len(jobs_list) < API_PAGE_SIZE:
                 self._log(hooks, f"51job {kw} 已到末页（本页 {len(jobs_list)} 条 < {API_PAGE_SIZE}），结束本词",
                           phase="loading_list", keyword=kw, city=city, page=page)
+                # 本词已无更多结果：断点推进到上限页，下次直接跳过本词
+                if self.safety_conn is not None:
+                    upsert_page_progress(self.safety_conn, "51job", city, kw, max_pages)
                 break
 
-        # 词结束：标记词级断点 + 清页级断点
+        # 词结束：标记词级断点；页级断点保留（空页时已推进到上限页），到期自动失效
         if self.safety_conn is not None:
             mark_combo_collected(self.safety_conn, "51job", city, kw)
-            delete_page_progress(self.safety_conn, "51job", city, kw)
+        return "resumed" if saved_page > 0 else "scanned"
 
     @staticmethod
     def _real_last_page(analysis: dict, fallback: int) -> int:

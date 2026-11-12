@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ScoringProgress } from './ScoringProgress'
 import { Button } from '@/components/ui/button'
 
 type ScoreScope = 'pending' | 'failed' | 'selected' | 'all_scored'
@@ -16,7 +17,8 @@ interface ScoreJobsDialogProps {
   open: boolean
   selectedJobIds: string[]
   onClose: () => void
-  onStart: (options: { scope: ScoreScope; limit: number | null; job_ids: string[]; force_rescore: boolean }) => Promise<void>
+  /** 返回启动结果：成功返回 ok:true（弹窗自动关闭），失败返回错误信息（弹窗保留并展示）。 */
+  onStart: (options: { scope: ScoreScope; limit: number | null; job_ids: string[]; force_rescore: boolean }) => Promise<{ ok: boolean; error?: string }>
 }
 
 interface ScoringRun {
@@ -40,8 +42,11 @@ export function ScoreJobsDialog({ open, selectedJobIds, onClose, onStart }: Scor
   const [limitText, setLimitText] = useState('全部')
   const [preview, setPreview] = useState<ScorePreview | null>(null)
   const [runs, setRuns] = useState<ScoringRun[]>([])
+  const [runsError, setRunsError] = useState('')
   const [loading, setLoading] = useState(false)
   const [message, setMessage] = useState('')
+  const runsRequestRef = useRef<AbortController | null>(null)
+  const runsRequestRevisionRef = useRef(0)
 
   const normalizedLimit = limitText.trim()
   const limitValid = normalizedLimit === ''
@@ -80,15 +85,46 @@ export function ScoreJobsDialog({ open, selectedJobIds, onClose, onStart }: Scor
     }
   }
 
-  const loadRuns = async () => {
-    const res = await fetch('/api/scoring/runs', { cache: 'no-store' })
-    if (res.ok) setRuns(await res.json())
-  }
+  const loadRuns = useCallback(async () => {
+    // A slow response must not overlap the next poll and overwrite a newer progress value.
+    if (runsRequestRef.current) return
+    const controller = new AbortController()
+    const revision = ++runsRequestRevisionRef.current
+    runsRequestRef.current = controller
+    const timeout = window.setTimeout(() => controller.abort(), 15000)
+    try {
+      const res = await fetch('/api/scoring/runs', { cache: 'no-store', signal: controller.signal })
+      if (!res.ok) throw new Error('无法刷新评分进度，请检查服务连接。')
+      const data: ScoringRun[] = await res.json()
+      if (!controller.signal.aborted && runsRequestRef.current === controller && revision === runsRequestRevisionRef.current) {
+        setRuns(data)
+        setRunsError('')
+      }
+    } catch {
+      if (!controller.signal.aborted && runsRequestRef.current === controller && revision === runsRequestRevisionRef.current) {
+        setRunsError('无法刷新评分进度，请检查服务连接。')
+      }
+    } finally {
+      window.clearTimeout(timeout)
+      if (runsRequestRef.current === controller) runsRequestRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!open) return
+    void loadRuns()
+    const timer = window.setInterval(() => void loadRuns(), 3000)
+    return () => {
+      window.clearInterval(timer)
+      runsRequestRevisionRef.current += 1
+      runsRequestRef.current?.abort()
+      runsRequestRef.current = null
+    }
+  }, [open, loadRuns])
 
   useEffect(() => {
     if (open) {
       void loadPreview()
-      void loadRuns()
     }
   }, [open, scope, limit, selectedJobIds.join(',')])
 
@@ -99,12 +135,16 @@ export function ScoreJobsDialog({ open, selectedJobIds, onClose, onStart }: Scor
     if (scope === 'all_scored' && !window.confirm('将重新评分所有仍可重评的有效评分岗位，已进入投递链路的岗位不会触碰。确认继续？')) return
     if (!window.confirm(`本轮最多发出 ${preview.max_possible_requests} 次 AI 请求，是否开始？`)) return
     setLoading(true)
+    setMessage('')
     try {
-      await onStart({ scope, limit, job_ids: scope === 'selected' ? selectedJobIds : [], force_rescore: scope === 'all_scored' })
-      setMessage('评分任务已启动；可以关闭窗口，后台会继续执行。')
-      await loadRuns()
+      const result = await onStart({ scope, limit, job_ids: scope === 'selected' ? selectedJobIds : [], force_rescore: scope === 'all_scored' })
+      if (result.ok) {
+        onClose()
+        return
+      }
+      setMessage(result.error || '启动评分失败，请稍后重试。')
     } catch (err) {
-      setMessage(err instanceof Error ? err.message : '启动评分失败')
+      setMessage(err instanceof Error ? err.message : '启动评分失败，请稍后重试。')
     } finally {
       setLoading(false)
     }
@@ -131,7 +171,7 @@ export function ScoreJobsDialog({ open, selectedJobIds, onClose, onStart }: Scor
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-5">
-      <div className="w-full max-w-xl rounded-3xl border border-card-border bg-white p-6 shadow-2xl">
+      <div className="w-full max-w-xl rounded-3xl border border-card-border bg-card p-6 shadow-2xl">
         <div className="flex items-start justify-between gap-4">
           <div>
             <div className="text-xs font-black tracking-[0.18em] text-primary">AI SCORING</div>
@@ -143,15 +183,15 @@ export function ScoreJobsDialog({ open, selectedJobIds, onClose, onStart }: Scor
         <div className="mt-5 space-y-4">
           <label className="block text-xs font-bold text-muted">
             评分范围
-            <select value={scope} onChange={event => setScope(event.target.value as ScoreScope)} className="mt-1 w-full rounded-xl border border-card-border bg-[#FFFCFA] px-3 py-2 text-sm text-foreground outline-none focus:border-primary">
+            <select value={scope} onChange={event => setScope(event.target.value as ScoreScope)} className="mt-1 w-full rounded-xl border border-card-border bg-surface px-3 py-2 text-sm text-foreground outline-none focus:border-primary">
               {Object.entries(scopeLabels).map(([value, label]) => <option value={value} key={value}>{label}</option>)}
             </select>
           </label>
           <label className="block text-xs font-bold text-muted">
             数量（输入正整数，或输入“全部”）
-            <input value={limitText} onChange={event => setLimitText(event.target.value)} className="mt-1 w-full rounded-xl border border-card-border bg-[#FFFCFA] px-3 py-2 text-sm text-foreground outline-none focus:border-primary" />
+            <input value={limitText} onChange={event => setLimitText(event.target.value)} className="mt-1 w-full rounded-xl border border-card-border bg-surface px-3 py-2 text-sm text-foreground outline-none focus:border-primary" />
           </label>
-          {scope === 'selected' && <div className="rounded-xl bg-[#FFF0E5] px-3 py-2 text-sm text-primary">岗位池已选择 {selectedJobIds.length} 条</div>}
+          {scope === 'selected' && <div className="rounded-xl bg-secondary px-3 py-2 text-sm text-primary">岗位池已选择 {selectedJobIds.length} 条</div>}
           {preview && (
             <div className="grid grid-cols-2 gap-2 text-sm">
               <Metric label="符合条件" value={preview.eligible_jobs} />
@@ -160,16 +200,18 @@ export function ScoreJobsDialog({ open, selectedJobIds, onClose, onStart }: Scor
               <Metric label="考虑重试最大请求" value={preview.max_possible_requests} />
             </div>
           )}
-          <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-800">
+          <div className="rounded-2xl border border-warning-border bg-warning-soft p-3 text-xs leading-5 text-warning-strong">
             基础预览不会调用 AI。正式评分会产生模型请求；单岗位格式错误会记录并继续，鉴权、额度、模型或连续网络错误会安全暂停。
           </div>
           {runs.filter(run => ['running', 'paused'].includes(run.status)).slice(0, 3).map(run => (
-            <div key={run.id} className="rounded-2xl border border-card-border bg-[#FFFCFA] p-3 text-sm">
+            <div key={run.id} className="rounded-2xl border border-card-border bg-surface p-3 text-sm">
               <div className="flex flex-wrap items-center justify-between gap-2"><span className="font-black">{run.status === 'running' ? '评分中' : '已暂停'} · 剩余 {run.remaining_job_ids.length} 个岗位</span><div className="flex gap-2">{run.status === 'running' && <Button variant="secondary" size="sm" onClick={() => void runAction(run, 'pause')}>暂停</Button>}{run.recoverable && <Button size="sm" onClick={() => void runAction(run, 'resume')}>继续</Button>}<Button variant="ghost" size="sm" onClick={() => void runAction(run, 'end')}>结束</Button></div></div>
+              <ScoringProgress metrics={run.progress} status={run.status} />
               {run.pause_reason && <p className="mt-1 text-xs text-muted">{run.pause_reason}</p>}
             </div>
           ))}
-          {message && <div className="rounded-xl bg-[#FFF0E5] px-3 py-2 text-sm text-primary">{message}</div>}
+          {runsError && <p className="text-sm text-danger" role="status">{runsError}</p>}
+          {message && <div className="rounded-xl bg-secondary px-3 py-2 text-sm text-primary">{message}</div>}
           <div className="flex justify-end gap-2">
             <Button variant="secondary" onClick={onClose}>取消</Button>
             <Button onClick={start} disabled={loading || !limitValid || !preview?.eligible_jobs || Boolean(activeRun)}>{loading ? '处理中...' : '确认开始评分'}</Button>
@@ -181,5 +223,5 @@ export function ScoreJobsDialog({ open, selectedJobIds, onClose, onStart }: Scor
 }
 
 function Metric({ label, value }: { label: string; value: number }) {
-  return <div className="rounded-xl border border-card-border bg-[#FFFCFA] p-3"><div className="text-xs text-muted">{label}</div><div className="mt-1 text-xl font-black text-primary">{value}</div></div>
+  return <div className="rounded-xl border border-card-border bg-surface p-3"><div className="text-xs text-muted">{label}</div><div className="mt-1 text-xl font-black text-primary">{value}</div></div>
 }

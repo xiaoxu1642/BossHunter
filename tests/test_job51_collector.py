@@ -332,7 +332,6 @@ class CollectionFlowSafetyTests(TestCase):
             patch("bosshunter.collection.platforms.job51.upsert_page_progress",
                   side_effect=lambda _conn, _source, _city, _keyword, page: checkpoints.append(page)),
             patch("bosshunter.collection.platforms.job51.mark_combo_collected") as mark_complete,
-            patch("bosshunter.collection.platforms.job51.delete_page_progress"),
             patch("bosshunter.collection.platforms.job51._wait_or_stop", return_value=False),
             patch.object(Job51Collector, "_plan_probe_pages", return_value=[3]),
             patch.object(collector, "_fetch_page", side_effect=fetch_page),
@@ -349,6 +348,8 @@ class CollectionFlowSafetyTests(TestCase):
 
         self.assertEqual(fetched_pages, [3, 1, 2, 4, 5])
         self.assertEqual(checkpoints, [1, 2, 3, 4, 5])
+        # 页级断点保留在最后一页，供下次续采（不再在词结束时清除）
+        self.assertEqual(checkpoints[-1], 5)
         mark_complete.assert_called_once()
 
     def test_collect_only_closes_temporary_host_tab(self):
@@ -475,8 +476,9 @@ class IsInternshipTests(TestCase):
     def test_detects_intern_english(self):
         self.assertTrue(_is_internship("Software Intern", ""))
 
-    def test_detects_guanpei(self):
-        self.assertTrue(_is_internship("管培生", ""))
+    def test_guanpei_is_not_treated_as_internship(self):
+        # 本地定制：管培不再算实习（用户已毕业，只拒实习）。上游原本断言 True。
+        self.assertFalse(_is_internship("管培生", ""))
 
     def test_non_internship_returns_false(self):
         self.assertFalse(_is_internship("高级工程师", "3年"))
@@ -485,11 +487,11 @@ class IsInternshipTests(TestCase):
 class SalaryWithinRangeTests(TestCase):
     """_salary_within_range — 薪资范围过滤。"""
 
-    def test_no_filter_passes_all(self):
-        self.assertTrue(_salary_within_range("面议", 0, 0))
+    def test_unknown_salary_uses_shared_default(self):
+        self.assertFalse(_salary_within_range("面议", 0, 0))
 
     def test_unparseable_passes(self):
-        self.assertTrue(_salary_within_range("面议", 10, 30))
+        self.assertTrue(_salary_within_range("面议", 10, 30, {"filter_unparsed_salary": False}))
 
     def test_below_min_rejected(self):
         self.assertFalse(_salary_within_range("5K", 10, 0))
@@ -660,12 +662,35 @@ class PassesCollectorFiltersTests(TestCase):
 class FetchPageTests(TestCase):
     """_fetch_page — API 页面获取与分析。"""
 
-    def test_none_evaluate_returns_l3_empty(self):
-        collector = Job51Collector(browser=Job51Browser(evaluate=Mock(return_value=None)))
+    def test_none_evaluate_returns_l3_empty_after_recovery_attempts(self):
+        evaluate, sleep = Mock(return_value=None), Mock()
+        collector = Job51Collector(browser=Job51Browser(evaluate=evaluate), sleep=sleep)
         result = collector._fetch_page("host", "kw", "020000", 1)
         self.assertFalse(result["ok"])
         self.assertEqual(result["level"], 3)
         self.assertEqual(result["signal"], "empty_result")
+        self.assertEqual(evaluate.call_count, 5)                       # first try + four recovery attempts
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [8, 20, 60, 180])
+
+    def test_a_stalled_call_that_recovers_is_not_a_risk_stop(self):
+        body = _ok_body([{"jobName": "AI"}], total=100)
+        raw = json.dumps({"http_status": 200, "content_type": "application/json", "body": body})
+        evaluate, sleep = Mock(side_effect=[None, raw]), Mock()
+        collector = Job51Collector(browser=Job51Browser(evaluate=evaluate), sleep=sleep)
+        result = collector._fetch_page("host", "kw", "020000", 1)
+        self.assertTrue(result["ok"])
+        sleep.assert_called_once_with(8)
+
+    def test_persistent_silence_slows_the_rhythm_before_giving_up(self):
+        from bosshunter.collection.platforms.job51 import _ApiRateLimiter
+
+        limiter = _ApiRateLimiter(total_requests=10)
+        gap, per_min = limiter._gap_range, limiter._per_min_limit
+        collector = Job51Collector(browser=Job51Browser(evaluate=Mock(return_value=None)), sleep=Mock())
+        collector._limiter = limiter
+        collector._fetch_page("host", "kw", "020000", 1)
+        self.assertEqual(limiter._gap_range, tuple(v * 4 for v in gap))      # slowed twice
+        self.assertLess(limiter._per_min_limit, per_min)
 
     def test_error_wrapper_returns_l3_fetch_error(self):
         raw = json.dumps({"error": "NetworkError"})
@@ -751,6 +776,20 @@ class CollectEntryTests(TestCase):
         with patch("bosshunter.collection.platforms.job51.SendWindowChecker.is_active", return_value=False):
             result = collector.collect(request, self._hooks())
         self.assertEqual(result.status, "completed")
+        self.assertEqual(result.reason_code, "outside_window")
+
+    def test_collection_window_is_independent_of_send_window(self):
+        request = PlatformCollectionRequest(
+            "51job", ["AI"], ["上海"], {"上海": "020000"}, max_pages=1,
+        )
+        collector = Job51Collector(config={
+            "throttle": {"send_windows": ["08:30-12:30", "13:30-18:30"]},
+            "collection": {"collect_windows": ["06:00-11:30", "13:30-22:30"]},
+        })
+        with patch("bosshunter.collection.platforms.job51.SendWindowChecker") as checker:
+            checker.return_value.is_active.return_value = False
+            result = collector.collect(request, self._hooks())
+        checker.assert_called_once_with(["06:00-11:30", "13:30-22:30"])
         self.assertEqual(result.reason_code, "outside_window")
 
     def test_day_off_returns_completed(self):
@@ -900,3 +939,72 @@ class CollectSalaryParseErrorTests(TestCase):
         ):
             result = collector.collect(request, self._hooks())
         self.assertEqual(result.status, "completed")
+
+
+class Job51FilterRegressionTests(TestCase):
+    def test_salary_matches_shared_prefilter_and_preserves_config(self):
+        from bosshunter.ai.prefilter import quick_score
+
+        for ratio in (1.0, 1.5, 2.0):
+            for unknown in (False, True):
+                profile = {"salary_min": 12, "salary_max": 20,
+                           "salary_ceil_ratio": ratio, "filter_unparsed_salary": unknown}
+                collector = Job51Collector(config={"profile": profile})
+                for salary in ("10-15K", "10-20K", "12-20K", "15-25K", "20-30K", "5K", "50K", "面议"):
+                    with self.subTest(ratio=ratio, unknown=unknown, salary=salary):
+                        expected = quick_score({"salary": salary}, {"profile": profile})[0] > 0
+                        candidate = JobCandidate("51job", "sample", "IT运维工程师", "示例公司", salary=salary)
+                        self.assertEqual(collector._passes_collector_filters(
+                            candidate, "IT运维", allow_internship=False, salary_min=12, salary_max=20,
+                        ), expected)
+                        self.assertEqual(collector._would_be_collected(
+                            candidate, "IT运维", allow_internship=False, salary_min=12, salary_max=20,
+                            deal_breakers=[], jd_deal_breakers=[], blocked_companies=[],
+                        ), expected)
+
+    def test_title_whitespace_without_english_substring_false_positives(self):
+        for title in ("IT 运维工程师", "IT\u3000运维工程师", "IT 技术支持工程师"):
+            keyword = "IT技术支持" if "支持" in title else "IT运维"
+            self.assertTrue(_is_relevant_to_keyword(title, "", keyword))
+        self.assertFalse(_is_relevant_to_keyword("Waiter", "", "IT主管"))
+        self.assertFalse(_is_relevant_to_keyword("Retail经理", "", "ai"))
+
+    def test_original_pipeline_saves_overlap_jobs_and_spaced_titles(self):
+        import tempfile
+        from pathlib import Path
+        from bosshunter.collection.orchestrator import CollectionOrchestrator
+        from bosshunter.db import get_db, insert_job
+
+        salaries = ["10-15K", "10-20K", "12-20K", "15-25K", "20-30K", "5K", "50K", "12-20K"]
+        items = [{"jobId": str(i), "jobName": "IT 运维工程师" if i != 7 else "财务主管",
+                  "provideSalaryString": salary, "fullCompanyName": "示例公司"}
+                 for i, salary in enumerate(salaries)]
+        wrapper = json.dumps({"http_status": 200, "content_type": "application/json", "body": _ok_body(items)})
+        browser = Job51Browser(evaluate=Mock(return_value=wrapper), close_tab=Mock())
+        profile = {"salary_min": 12, "salary_max": 20, "filter_unparsed_salary": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "isolated.db"
+            conn = get_db(db_path)
+            insert_job(conn, Job51Collector._item_to_candidate(items[2], "上海", "020000", "IT运维").as_job_record())
+            conn.close()
+            with (
+                patch("bosshunter.collection.platforms.job51.Job51Browser", return_value=browser),
+                patch.object(Job51Collector, "_ensure_host_tab", return_value=("fake", False)),
+                patch("bosshunter.collection.platforms.job51.SendWindowChecker.is_active", return_value=True),
+                patch("bosshunter.collection.platforms.job51.should_take_day_off", return_value=False),
+                patch("bosshunter.collection.platforms.job51._wait_or_stop", return_value=False),
+                patch.object(_ApiRateLimiter, "wait_before_request", return_value=True),
+            ):
+                result = CollectionOrchestrator({"profile": profile}, db_path=db_path).run({
+                    "platform_order": ["51job"], "auto_score": False,
+                    "platforms": {"51job": {"keywords": ["IT运维"], "cities": ["上海"],
+                                              "city_codes": {"上海": "020000"}, "max_pages": 1, "sort": "default"}},
+                })
+            state = result["platforms"]["51job"]
+            self.assertEqual(state["new"], 4)
+            self.assertEqual(state["duplicate"], 1)
+            self.assertEqual(state["seen"], 5)
+            self.assertEqual(browser.evaluate.call_count, 1)
+            conn = get_db(db_path)
+            self.assertEqual(conn.execute("select count(*) from jobs").fetchone()[0], 5)
+            conn.close()

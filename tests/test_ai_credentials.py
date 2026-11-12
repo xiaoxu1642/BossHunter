@@ -735,6 +735,123 @@ class AnthropicCredentialTests(unittest.TestCase):
         self.assertNotIn("thinking", post.call_args_list[1].kwargs["json"])
         self.assertEqual(post.call_args_list[1].kwargs["json"]["max_tokens"], 3072)
 
+    def test_openai_auto_thinking_handles_gateway_reasoning_effort_rejection(self):
+        # Reproduce gateways that translate thinking=disabled to an unsupported
+        # reasoning effort. The error never mentions the original thinking field.
+        import httpx
+
+        config = {
+            "ai": {
+                "provider": "openai_compatible",
+                "service": "custom",
+                "base_url": "https://gateway.example/v1",
+                "model": "reasoning-model",
+                "api_key": "local-secret",
+                "thinking": "auto",
+            }
+        }
+        request = httpx.Request("POST", "https://gateway.example/v1/chat/completions")
+        for parameter in ("reasoning effort", "reasoning_effort"):
+            with self.subTest(parameter=parameter):
+                rejected = httpx.Response(
+                    400,
+                    request=request,
+                    json={"error": {"message": f'model does not support {parameter} "none"; use low, medium, high'}},
+                )
+                success = httpx.Response(
+                    200, request=request,
+                    json={"choices": [{"finish_reason": "stop", "message": {"content": "score result"}}]},
+                )
+                with patch(
+                    "bosshunter.ai.credentials.httpx.post", side_effect=[rejected, success],
+                ) as post:
+                    result = credentials.call_anthropic_text("full scoring prompt", config, 8192, purpose="scoring")
+
+                self.assertEqual(result, "score result")
+                self.assertEqual(post.call_count, 2)
+                first, fallback = [call.kwargs["json"] for call in post.call_args_list]
+                self.assertEqual(first.pop("thinking"), {"type": "disabled"})
+                self.assertNotIn("thinking", fallback)
+                self.assertEqual(first, fallback)
+                self.assertEqual(fallback["max_tokens"], 8192)
+
+    def test_openai_auto_thinking_does_not_retry_service_failures(self):
+        import httpx
+
+        config = {
+            "ai": {
+                "provider": "openai_compatible",
+                "service": "custom",
+                "base_url": "https://gateway.example/v1",
+                "model": "reasoning-model",
+                "api_key": "local-secret",
+                "thinking": "auto",
+            }
+        }
+        request = httpx.Request("POST", "https://gateway.example/v1/chat/completions")
+        for status, message, kind in (
+            (401, "reasoning effort model is unauthorized", "auth"),
+            (429, "reasoning effort rate limit", "rate_limit"),
+            (500, "reasoning effort service unavailable", "request_failed"),
+            (400, "invalid messages content", "request_failed"),
+        ):
+            with self.subTest(status=status):
+                response = httpx.Response(status, request=request, json={"error": {"message": message}})
+                with patch("bosshunter.ai.credentials.httpx.post", return_value=response) as post:
+                    with self.assertRaises(credentials.AIRequestError) as raised:
+                        credentials.call_openai_compatible_text("prompt", config, 8192)
+                self.assertEqual(post.call_count, 1)
+                self.assertEqual(raised.exception.kind, kind)
+                self.assertNotIn("local-secret", str(raised.exception))
+
+    def test_unroutable_model_404_is_reported_as_model_not_found(self):
+        """模型列表里有该 ID、生成接口却 404 时，错误必须指向模型而不是笼统的请求失败。"""
+        import httpx
+
+        config = {
+            "ai": {
+                "provider": "openai_compatible",
+                "service": "custom",
+                "base_url": "https://gateway.example/v1",
+                "model": "u2-flash",
+                "api_key": "local-secret",
+                "thinking": "off",
+            }
+        }
+        request = httpx.Request("POST", "https://gateway.example/v1/chat/completions")
+        for body in ({"message": "Model not found", "code": 404}, {"error": {"code": "model_not_found"}}):
+            with self.subTest(body=body):
+                response = httpx.Response(404, request=request, json=body)
+                with patch("bosshunter.ai.credentials.httpx.post", return_value=response):
+                    with self.assertRaises(credentials.AIRequestError) as raised:
+                        credentials.call_openai_compatible_text("prompt", config, 64)
+                self.assertEqual(raised.exception.kind, "model_not_found")
+                self.assertEqual(raised.exception.status_code, 404)
+                self.assertIn("更换模型", str(raised.exception))
+                self.assertNotIn("local-secret", str(raised.exception))
+
+    def test_base_url_404_is_not_mistaken_for_missing_model(self):
+        """Base URL 路径写错时错误体通常不含模型关键词，不能误报成模型不存在。"""
+        import httpx
+
+        config = {
+            "ai": {
+                "provider": "openai_compatible",
+                "service": "custom",
+                "base_url": "https://gateway.example/v1",
+                "model": "u2-med",
+                "api_key": "local-secret",
+                "thinking": "off",
+            }
+        }
+        request = httpx.Request("POST", "https://gateway.example/v1/chat/completions")
+        response = httpx.Response(404, request=request, json={"base_resp": {"status_code": 100301, "status_msg": "path error"}})
+        with patch("bosshunter.ai.credentials.httpx.post", return_value=response):
+            with self.assertRaises(credentials.AIRequestError) as raised:
+                credentials.call_openai_compatible_text("prompt", config, 64)
+
+        self.assertEqual(raised.exception.kind, "request_failed")
+
     def test_openai_enabled_thinking_uses_provider_default_reasoning_mode(self):
         class CompletionResponse:
             status_code = 200

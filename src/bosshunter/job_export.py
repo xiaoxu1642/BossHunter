@@ -10,7 +10,7 @@ import sqlite3
 from typing import Any, Iterable
 
 from bosshunter.cities import get_city_code
-from bosshunter.job_filters import parse_monthly_salary_k
+from bosshunter.job_filters import city_match_clause, parse_monthly_salary_k
 
 
 MAX_EXPORT_JOB_IDS = 1000
@@ -90,30 +90,47 @@ def _filtered_rows(conn: sqlite3.Connection, filters: dict[str, Any] | None = No
 	if keyword:
 		conditions.append("(title LIKE ? OR company LIKE ? OR jd LIKE ? OR score_reason LIKE ?)")
 		params.extend([f"%{keyword}%"] * 4)
-	city = str(filters.get("city") or "").strip()
-	if city:
-		conditions.append("city = ?")
-		params.append(city)
-	status = str(filters.get("status") or "").strip()
-	if status:
-		conditions.append("status = ?")
-		params.append(status)
-	source_platform = str(filters.get("source_platform") or "").strip()
-	if source_platform:
-		if source_platform not in {"boss", "zhilian", "51job", "liepin"}:
+	def values(name: str) -> list[str]:
+		value = filters.get(name)
+		if isinstance(value, list):
+			return [str(item).strip() for item in value if str(item).strip()]
+		return [str(value).strip()] if str(value or "").strip() else []
+
+	cities = values("city")
+	if cities:
+		city_clause, city_params = city_match_clause(cities)
+		conditions.append(city_clause)
+		params.extend(city_params)
+
+	status_values = values("status")
+	if status_values:
+		placeholders = ",".join("?" for _ in status_values)
+		conditions.append(f"status IN ({placeholders})")
+		params.extend(status_values)
+	source_platforms = values("source_platform")
+	if source_platforms:
+		if any(value not in {"boss", "zhilian", "51job", "liepin"} for value in source_platforms):
 			raise ValueError("source_platform 参数无效")
-		conditions.append("COALESCE(source_platform, 'boss') = ?")
-		params.append(source_platform)
-	recruitment_type = str(filters.get("recruitment_type") or "").strip()
-	if recruitment_type:
-		if recruitment_type not in {"campus", "experienced", "unknown"}:
+		placeholders = ",".join("?" for _ in source_platforms)
+		conditions.append(f"COALESCE(source_platform, 'boss') IN ({placeholders})")
+		params.extend(source_platforms)
+	recruitment_types = values("recruitment_type")
+	if recruitment_types:
+		if any(value not in {"campus", "experienced", "unknown"} for value in recruitment_types):
 			raise ValueError("recruitment_type 参数无效")
-		conditions.append("COALESCE(recruitment_type, 'unknown') = ?")
-		params.append(recruitment_type)
-	education = str(filters.get("education") or "").strip()
-	if education:
-		conditions.append("education LIKE ?")
-		params.append(f"%{education}%")
+		placeholders = ",".join("?" for _ in recruitment_types)
+		conditions.append(f"COALESCE(recruitment_type, 'unknown') IN ({placeholders})")
+		params.extend(recruitment_types)
+	educations = values("education")
+	if educations:
+		education_conditions = []
+		for value in educations:
+			if value == "unknown":
+				education_conditions.append("COALESCE(TRIM(education), '') = ''")
+			else:
+				education_conditions.append("education LIKE ?")
+				params.append(f"%{value}%")
+		conditions.append(f"({' OR '.join(education_conditions)})")
 	minimum_score = filters.get("min_score")
 	if minimum_score not in (None, ""):
 		try:
@@ -237,9 +254,17 @@ def _row_values(job: dict[str, Any]) -> list[Any]:
 	return [job.get(key, "") if job.get(key) is not None else "" for _, key in EXPORT_COLUMNS]
 
 
+# 招聘平台与 AI 生成的字段可能以公式前缀开头；CSV 与 XLSX 共用同一判定。
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _is_formula_like(value: Any) -> bool:
+	return isinstance(value, str) and value.lstrip().startswith(_FORMULA_PREFIXES)
+
+
 def _csv_safe(value: Any) -> str:
 	text = "" if value is None else str(value)
-	if text.lstrip().startswith(("=", "+", "-", "@", "\t", "\r")):
+	if _is_formula_like(text):
 		return "'" + text
 	return text
 
@@ -269,6 +294,11 @@ def build_xlsx(rows: list[dict[str, Any]]) -> bytes:
 	for job in rows:
 		values = _row_values(job)
 		sheet.append(values)
+		# openpyxl 会把「=」开头的字符串写成公式单元格；强制回文本，避免打开导出文件
+		# 时执行平台数据或招呼语里的公式。CSV 侧由 _csv_safe 加前导撇号实现同一策略。
+		for cell, value in zip(sheet[sheet.max_row], values):
+			if _is_formula_like(value):
+				cell.data_type = "s"
 		url_column = next(index for index, (_, key) in enumerate(EXPORT_COLUMNS, start=1) if key == "url")
 		cell = sheet.cell(sheet.max_row, url_column)
 		if cell.value:

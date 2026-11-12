@@ -142,6 +142,13 @@ def normalize_ai_error(exc: Exception, response: object | None = None) -> AIRequ
         "限流",
         "频率限制",
     )
+    model_markers = (
+        "model not found",
+        "model_not_found",
+        "no such model",
+        "模型不存在",
+        "模型不可用",
+    )
 
     # 判定顺序：明确的 401/403 状态最先归为鉴权——错误体关键词只是启发式，401+「额度」类
     # 混排错误体不应误导恢复建议。其后额度/限流先于上下文：真实错误体常混排多种提示（如
@@ -157,6 +164,14 @@ def normalize_ai_error(exc: Exception, response: object | None = None) -> AIRequ
         return AIRequestError("context_limit", "请求内容超过当前模型的上下文限制", status_code)
     if any(marker in raw for marker in output_limit_markers):
         return AIRequestError("output_limit", "当前模型不接受设置的输出 Token 上限", status_code)
+    # 真实遇到过"模型列表里有该 ID、生成接口却 404"的网关（issue #101 同源）。
+    # 只在 404 + 明确提到模型时归为模型问题，避免把 Base URL 写错也误报成模型不存在。
+    if status_code == 404 and any(marker in raw for marker in model_markers):
+        return AIRequestError(
+            "model_not_found",
+            "AI 模型不存在或当前 Key 无权访问该模型，请在“配置 → AI 设置”中更换模型",
+            status_code,
+        )
     if isinstance(exc, httpx.InvalidURL):
         return AIRequestError("invalid_url", "AI 接口地址无效", status_code)
     if isinstance(exc, httpx.RequestError):
@@ -280,6 +295,10 @@ def _is_thinking_compatibility_error(exc: Exception, response: object | None = N
     parameter_markers = (
         "thinking",
         "budget_tokens",
+        # Some gateways translate thinking=disabled into reasoning_effort=none.
+        # Models that require reasoning reject that value instead of "thinking".
+        "reasoning_effort",
+        "reasoning effort",
         "unknown field",
         "unknown parameter",
         "extra inputs",
@@ -401,6 +420,64 @@ def get_ai_base_url_source(config: dict) -> str | None:
     if AI_SERVICE_PRESETS[service]["base_url"]:
         return "服务商预设"
     return None
+
+
+def list_ai_models(config: dict) -> list[str]:
+    """Fetch model IDs without sending prompts or exposing provider error bodies."""
+    anthropic = get_ai_service(config) == "anthropic"
+    base = (get_ai_base_url(config) or ("https://api.anthropic.com" if anthropic else "")).strip().rstrip("/")
+    try:
+        url = httpx.URL(base)
+        if url.scheme not in {"http", "https"} or not url.host or url.userinfo or url.query or url.fragment:
+            raise ValueError
+    except (httpx.InvalidURL, ValueError):
+        raise AIRequestError("invalid_url", "请填写有效的 Base URL（http:// 或 https://，不含查询参数）") from None
+    key = get_ai_api_key(config)
+    if not key:
+        raise AIRequestError("auth", "请先填写 API Key，再获取模型列表")
+
+    headers = {"Authorization": f"Bearer {key}"}
+    if anthropic:
+        kwargs = build_anthropic_client_kwargs(config)
+        headers = {"anthropic-version": "2023-06-01"}
+        if kwargs.get("auth_token"):
+            headers["Authorization"] = f"Bearer {kwargs['auth_token']}"
+        else:
+            headers["x-api-key"] = key
+    endpoint = f"{base}/models"
+    if anthropic and not base.endswith("/v1"):
+        endpoint = f"{base}/v1/models"
+    params = {"limit": 1000} if anthropic else {}
+    models: set[str] = set()
+    cursors: set[str] = set()
+    while True:
+        try:
+            result = httpx.get(endpoint, headers=headers, params=params, timeout=15, trust_env=False, follow_redirects=False)
+            # Some compatible services expose /v1/models at an unversioned base.
+            if result.status_code == 404 and not url.path.rstrip("/") and not anthropic:
+                endpoint = f"{base}/v1/models"
+                result = httpx.get(endpoint, headers=headers, timeout=15, trust_env=False, follow_redirects=False)
+            result.raise_for_status()
+            payload = result.json()
+        except ValueError:
+            raise AIRequestError("invalid_response", "接口未返回有效的模型列表，请检查 Base URL 或手动填写模型 ID") from None
+        except Exception as exc:
+            if getattr(getattr(exc, "response", None), "status_code", None) in {404, 405}:
+                raise AIRequestError("unsupported", "该地址不支持获取模型列表，请检查 Base URL 或手动填写模型 ID") from None
+            raise normalize_ai_error(exc) from None
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            raise AIRequestError("invalid_response", "接口返回的模型列表格式不正确，可手动填写模型 ID")
+        models.update(
+            item["id"].strip() for item in payload["data"]
+            if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip()
+        )
+        if not anthropic or not payload.get("has_more"):
+            return sorted(models)
+        cursor = payload.get("last_id")
+        if not isinstance(cursor, str) or not cursor or cursor in cursors:
+            raise AIRequestError("invalid_response", "模型列表分页信息无效，可手动填写模型 ID")
+        cursors.add(cursor)
+        params["after_id"] = cursor
 
 
 def build_anthropic_client_kwargs(config: dict) -> dict:

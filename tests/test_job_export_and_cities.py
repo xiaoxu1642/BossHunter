@@ -159,6 +159,36 @@ def test_export_supports_liepin_source_filter_and_label(tmp_path):
 	assert "010" in text
 
 
+def test_export_supports_multi_select_filters(tmp_path):
+	db = get_db(tmp_path / "multi-filter-export.db")
+	try:
+		for job_id, platform, recruitment_type, education in (
+			("boss-job", "boss", "experienced", "本科"),
+			("zhilian-job", "zhilian", "campus", "硕士"),
+			("other-job", "liepin", "experienced", "大专"),
+		):
+			job = _job(job_id)
+			job.update({"source_platform": platform, "recruitment_type": recruitment_type, "education": education})
+			insert_job(db, job)
+		content, _, _ = export_jobs(
+			db,
+			format="csv",
+			scope="filtered",
+			filters={
+				"source_platform": ["boss", "zhilian"],
+				"recruitment_type": ["experienced", "campus"],
+				"education": ["本科", "硕士"],
+			},
+		)
+	finally:
+		db.close()
+
+	text = content.decode("utf-8-sig")
+	assert "boss-job" in text
+	assert "zhilian-job" in text
+	assert "other-job" not in text
+
+
 def test_selected_export_rejects_missing_ids(tmp_path):
 	db = get_db(tmp_path / "missing.db")
 	try:
@@ -181,6 +211,22 @@ def test_csv_has_bom_formula_protection_and_city_code():
 	assert "'=2+2" in text
 	assert "'-1" in text
 	assert "101010100" in text
+
+
+def test_xlsx_keeps_formula_like_values_as_text():
+	job = _job("xlsx-formula", company="=2+2")
+	job["jd"] = "+cmd|' /C calc'!A0"
+	job["salary"] = "-1"
+	workbook = load_workbook(io.BytesIO(build_xlsx([job])), read_only=False)
+	try:
+		sheet = workbook.active
+		columns = {cell.value: cell.column for cell in sheet[1]}
+		for column, value in (("公司", "=2+2"), ("JD", "+cmd|' /C calc'!A0"), ("薪资", "-1")):
+			cell = sheet.cell(2, columns[column])
+			assert cell.value == value
+			assert cell.data_type == "s"
+	finally:
+		workbook.close()
 
 
 def test_xlsx_contains_clickable_job_url():
