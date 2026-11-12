@@ -1,5 +1,17 @@
 # 本地定制 vs 上游 main 合并清单
 
+> **状态：已执行完成（2026-11-12）**
+> 合并提交：`c73685d`（双父：`f4f7e8c` 本地快照 + `12d6891` 上游）
+> 结果：36 个冲突全部解决，`pytest 1436 passed` / `vitest 100 passed` / `tsc` 无错误
+> 备份：`C:\KaiFa\boss-backup-20261112-merge`，标签 `local-before-merge-20261112`
+>
+> 与下文预估的差异：
+> - 预估 25 个冲突，实际 36 个（真实工作区比试算快照多出 macOS 权限位、文档、
+>   `employment.py`、`SendWindowsInput.tsx`、`greetTask.ts`、`ConfigPage.test.tsx` 等）
+> - `cdp-proxy.mjs` 的 about:blank 一项按本文建议放弃本地、采用上游
+> - 额外清理：`DashboardPage.tsx` 内联 `blockCompany` 死代码、重复 `todayCityOptions`、
+>   重复 `test_salary_within_range_collected`、重复 `contextlib` import
+
 > 生成时间：2026-11-12
 > 本地：`main` @ `2e5f4f8`（10-13）+ 未提交工作区改动
 > 上游：`origin/main` @ `12d6891`（11-06），落后 86 个提交
