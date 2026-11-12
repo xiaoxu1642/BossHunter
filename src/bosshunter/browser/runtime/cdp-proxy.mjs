@@ -433,12 +433,11 @@ const server = http.createServer(async (req, res) => {
       const background = q.background === '1' || q.background === 'true';
       const resp = await sendCDP('Target.createTarget', { url: targetUrl, background });
       const targetId = resp.result.targetId;
-      // 本地有意选择：about:blank 占位标签暂不绑定 CDP 会话，避免无谓握手
-      if (targetUrl !== 'about:blank') {
-        try {
-          await ensureSession(targetId);
-        } catch {}
-      }
+      // Bind the CDP session eagerly (including about:blank tabs) so a later
+      // navigate cannot race against Chrome freezing the fresh background tab.
+      try {
+        await ensureSession(targetId);
+      } catch {}
       sendJson(res, { targetId });
     } else if (pathname === '/close') {
       const resp = await sendCDP('Target.closeTarget', { targetId: q.target });

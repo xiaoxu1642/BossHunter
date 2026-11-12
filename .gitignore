@@ -59,3 +59,7 @@ AGENTS.md
 # Local maintainer working docs (proposals/playbooks, not for VCS)
 PROPOSAL_*.md
 PR_REVIEW_PLAYBOOK.md
+
+# Local agent scratch/backup dirs (never part of the product)
+.workbuddy/
+.zcode/

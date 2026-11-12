@@ -3,7 +3,6 @@
 import json
 from contextlib import ExitStack, closing
 import tempfile
-from contextlib import closing
 from pathlib import Path
 from unittest import TestCase
 from unittest.mock import Mock
