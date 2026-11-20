@@ -150,7 +150,7 @@ class LiepinCollectorTests(LiepinTestBase):
         self.assertEqual(sleeps[-2:], [13.0, 13.0])
         self.assertIn("需求分析", collected[0].jd)
 
-    def test_verification_page_stops_platform(self):
+    def test_verification_page_skips_platform(self):
         browser = LiepinBrowser(
             new_tab=lambda url, **_kwargs: url,
             close_tab=lambda _target: True,
@@ -169,8 +169,8 @@ class LiepinCollectorTests(LiepinTestBase):
             PlatformCollectionRequest("liepin", ["AI"], ["上海"], {"上海": "020"}, max_pages=1),
             hooks,
         )
-        self.assertEqual(result.status, "blocked")
-        self.assertEqual(result.reason_code, "rate_limit")
+        self.assertEqual(result.status, "skipped")
+        self.assertEqual(result.reason_code, "liepin_risk_skipped")
 
     def test_collection_waits_for_spa_list_render(self):
         evaluations = 0
@@ -824,7 +824,7 @@ class LiepinResumeCheckpointTests(LiepinTestBase):
         # 页级断点在空页后推进到上限页，下次直接跳过本词
         self.assertEqual(checkpoints, [1, 2])
 
-    def test_blocked_page_does_not_mark_combo(self):
+    def test_skipped_page_does_not_mark_combo(self):
         browser = LiepinBrowser(
             new_tab=lambda url, **_kw: url,
             close_tab=lambda _t: True,
@@ -849,7 +849,7 @@ class LiepinResumeCheckpointTests(LiepinTestBase):
                 PlatformCollectionRequest("liepin", ["AI"], ["上海"], {"上海": "020"}, max_pages=3),
                 self._hooks(),
             )
-        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.status, "skipped")
         mark_complete.assert_not_called()
 
     def test_saved_page_exceeds_max_pages_skips_keyword(self):
@@ -1066,7 +1066,7 @@ class LiepinRiskControlTests(LiepinTestBase):
         self.assertEqual(opened, [])
         self.assertEqual(count_platform_access_today(conn, platform="liepin", stage="collection", action="search_page"), 60)
 
-    def test_blocked_list_writes_risk_lock_and_event(self):
+    def test_blocked_list_skips_liepin_without_global_risk_lock(self):
         conn = self._db()
         from bosshunter.db import get_active_platform_safety_lock
         collector = LiepinCollector(
@@ -1074,19 +1074,19 @@ class LiepinRiskControlTests(LiepinTestBase):
             sleep=lambda _s: None, uniform=lambda _a, _b: 0.0,
         )
         result = collector.collect(self._request(), self._hooks())
-        self.assertEqual(result.status, "blocked")
-        self.assertEqual(result.reason_code, "rate_limit")
+        self.assertEqual(result.status, "skipped")
+        self.assertEqual(result.reason_code, "liepin_risk_skipped")
+        self.assertIn("其他平台任务继续", result.message)
         lock = get_active_platform_safety_lock(conn)
-        self.assertIsNotNone(lock)
-        self.assertEqual(lock["reason"], "rate_limit")
+        self.assertIsNone(lock)
         rows = conn.execute("SELECT event_type FROM risk_events WHERE event_type LIKE 'collection_liepin%'").fetchall()
         self.assertTrue(any(r[0] == "collection_liepin_rate_limit" for r in rows))
 
     def test_detail_script_detects_network_anomaly_as_blocked(self):
         self.assertIn("网络异常", JS_EXTRACT_DETAIL)
 
-    def test_blanked_list_stops_and_writes_risk_lock(self):
-        """页面被清空(about:blank)按风控停机，不能当登录墙继续采集。"""
+    def test_blanked_list_skips_liepin_without_global_risk_lock(self):
+        """页面被清空(about:blank)只跳过猎聘，不冻结其他平台。"""
         conn = self._db()
         from bosshunter.db import get_active_platform_safety_lock
         collector = LiepinCollector(
@@ -1094,11 +1094,10 @@ class LiepinRiskControlTests(LiepinTestBase):
             sleep=lambda _s: None, uniform=lambda _a, _b: 0.0,
         )
         result = collector.collect(self._request(), self._hooks())
-        self.assertEqual(result.status, "blocked")
-        self.assertEqual(result.reason_code, "rate_limit")
+        self.assertEqual(result.status, "skipped")
+        self.assertEqual(result.reason_code, "liepin_risk_skipped")
         lock = get_active_platform_safety_lock(conn)
-        self.assertIsNotNone(lock)
-        self.assertEqual(lock["reason"], "rate_limit")
+        self.assertIsNone(lock)
 
     def test_blanked_detail_stops_platform(self):
         jobs = [{"source_job_id": "j1", "title": "AI 产品", "company": "c", "city": "上海",
@@ -1108,8 +1107,8 @@ class LiepinRiskControlTests(LiepinTestBase):
             sleep=lambda _s: None, uniform=lambda _a, _b: 0.0,
         )
         result = collector.collect(self._request(), self._hooks())
-        self.assertEqual(result.status, "blocked")
-        self.assertEqual(result.reason_code, "rate_limit")
+        self.assertEqual(result.status, "skipped")
+        self.assertEqual(result.reason_code, "liepin_risk_skipped")
 
     def test_risk_scripts_detect_ban_page_and_risk_url(self):
         for script in (JS_EXTRACT_LIST, JS_EXTRACT_DETAIL):

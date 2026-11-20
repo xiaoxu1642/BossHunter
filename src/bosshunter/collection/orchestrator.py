@@ -562,12 +562,13 @@ class CollectionOrchestrator:
                 })
                 all_new_ids.extend(result.new_job_ids)
                 self._persist(states, all_new_ids, platform, stop_reason=result.reason_code, error=result.error)
-                # A login wall belongs to the current recruitment platform:
-                # keep its blocked result but let independent later platforms
-                # continue. Other unknown/risk blocks remain queue-wide until
-                # they have an equally explicit platform-local classification.
+                # Platform-local skips and login walls keep their result but let
+                # independent later platforms continue. Other unknown/risk
+                # blocks remain queue-wide until they have an equally explicit
+                # platform-local classification.
+                platform_local_skips = result.reason_code in {"login_required", "liepin_risk_skipped"}
                 if (
-                    (result.status == "blocked" and result.reason_code != "login_required")
+                    (result.status == "blocked" and not platform_local_skips)
                     or result.reason_code in {"user_stopped", "browser_disconnected", "timing_gap", "persistence_error"}
                     or (self.stop_event and self.stop_event.is_set())
                 ):
@@ -580,7 +581,7 @@ class CollectionOrchestrator:
         stop_requested = bool(self.stop_event and self.stop_event.is_set())
         stopped = stop_requested or any(r.status == "stopped" or r.reason_code == "user_stopped" for r in platform_results)
         errors = any(r.status in {"blocked", "failed"} for r in platform_results)
-        shortages = any(r.status == "completed_with_shortage" for r in platform_results)
+        shortages = any(r.status in {"completed_with_shortage", "skipped"} for r in platform_results)
         outcome = "stopped" if stopped else "completed_with_errors" if errors else "completed_with_shortage" if shortages else "completed"
         if options["auto_score"] and unique_new_ids and not stopped and not errors and not any(r.reason_code == "timing_gap" for r in platform_results):
             try:

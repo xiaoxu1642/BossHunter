@@ -262,15 +262,15 @@ class LiepinHttpDetailCollectorTests(TestCase):
         self.assertEqual(collected[0].jd, "浏览器抓到的 JD")
         self.assertEqual(len(detail_calls), 1, "回退时没有打开浏览器详情页")
 
-    def test_http_blocked_stops_platform(self):
-        """HTTP 看到验证页必须 blocked + 风险事件，不能回退静默继续。"""
+    def test_http_blocked_skips_liepin(self):
+        """HTTP 看到验证页必须记录风险并只跳过猎聘，不能回退静默继续。"""
         browser, detail_calls = _browser(_list_payload([_job(1)]))
         collected: list = []
         blocked = LiepinDetailFetcher(get=lambda _u: FakeResponse(BLOCKED_HTML))
         result = self._collect(fetcher=blocked, browser=browser, collected=collected)
 
-        self.assertEqual(result.status, "blocked")
-        self.assertEqual(result.reason_code, "rate_limit")
+        self.assertEqual(result.status, "skipped")
+        self.assertEqual(result.reason_code, "liepin_risk_skipped")
         self.assertEqual(detail_calls, [], "blocked 后仍继续打开浏览器详情页")
 
     def test_http_offline_skips_job_without_browser(self):

@@ -59,7 +59,8 @@ JobKoi-AI `protection.py` 的原话：
 2. 列表页/详情页 JS 增加 URL 判定（`safe.liepin.com` / `captchaPage`）。
 3. 增加清页判定（`blanked`）：body 去空白后 < 20 字符；与 `login_required` 区分，
    渲染竞态由既有轮询兜底，重试耗尽后才判 `blocked`。
-4. `blocked` / `blanked` → 直接停止 + 写 `risk_event` + 加持久锁。
+4. `blocked` / `blanked` → 结束猎聘本平台采集 + 写 `risk_event`；不写全局持久锁，
+   编排器把猎聘标为 `skipped` 后继续其余平台。
 
 ### P1 · 节奏改造（✅ 已实施）
 
@@ -105,8 +106,9 @@ JobKoi-AI `protection.py` 的原话：
 | 熔断 | HTTP 连续失败 3 次后本轮剩余岗位直接走浏览器 |
 | 开关 | `platforms.liepin.search.http_detail_enabled`（默认 true） |
 
-**风控信号不降级**：HTTP 路径看到验证/限流文案仍返回 `blocked` +
-`risk_event` + 持久锁，**不**回退——回退会把风控信号吞掉，这是 P0 已修的缺陷。
+**风控信号不降级**：HTTP 路径看到验证/限流文案仍返回 `blocked` + `risk_event`
+并只跳过猎聘，**不**回退、不写全局持久锁——回退会把风控信号吞掉，全局锁会
+拖住其他平台，两者都是已修的缺陷。
 
 **未验证的风险**：搜索接口（`pc-search-job`）匿名也能调（494 条 / 10 页，
 每页 40），但当前**没有**改用它，因为：

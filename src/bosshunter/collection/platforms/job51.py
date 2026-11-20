@@ -656,6 +656,38 @@ class Job51Collector:
         if hooks is not None:
             self._log(hooks, message, phase="procuring")
 
+    def _process_cached_page(
+        self,
+        analysis: dict,
+        hooks: CollectorHooks,
+        *,
+        city: str,
+        area: str,
+        kw: str,
+        allow_internship: bool,
+        salary_min: float,
+        salary_max: float,
+    ) -> int:
+        """把已抓取但未进入热区的页面计入扫描，并保留去重/过滤/入库语义。"""
+        processed = 0
+        for item in analysis.get("jobs") or []:
+            cand = self._item_to_candidate(item, city, area, kw)
+            if cand is None:
+                continue
+            processed += 1
+            filter_reason = self._collector_filter_reason(
+                cand, kw, allow_internship=allow_internship,
+                salary_min=salary_min, salary_max=salary_max,
+            )
+            if filter_reason:
+                hooks.on_event(message=filter_reason, increment_filtered=True, filtered_candidate=cand)
+                continue
+            if not hooks.on_list_candidate(cand):
+                continue
+            if not hooks.on_candidate(cand):
+                raise CollectionBlockedError("callback_stopped", "采集回调已停止")
+        return processed
+
     def _fetch_page(self, host_target: str, kw_encoded: str, area: str, page: int) -> dict:
         """在宿主页上下文发一次 API 请求并分析返回，返回 _analyze_api_response 结果。"""
         js = JS_FETCH_API_PAGE.replace("__KW__", kw_encoded).replace("__AREA__", area).replace("__PAGE__", str(page))
@@ -837,7 +869,10 @@ class Job51Collector:
         probe_pages = self._plan_probe_pages(start_page, max_pages)
         hot_pages: set[int] = set()
         probe_cache: dict[int, dict] = {}
+        scan_cache: dict[int, dict] = {}
+        processed_pages: set[int] = set()
         probe_hits: list[str] = []
+        scanned_candidates = 0
 
         self._log(hooks, f"51job {kw} 分布式探针采样（{len(probe_pages)} 个点）", phase="procuring", keyword=kw, city=city)
         for pp in probe_pages:
@@ -864,6 +899,7 @@ class Job51Collector:
                 self._log(hooks, f"51job {kw} p{pp} 抽查无数据 signal={analysis.get('signal','?')}",
                           phase="procuring", keyword=kw, city=city, page=pp)
                 continue
+            scan_cache[pp] = analysis
             probe_cache[pp] = analysis
             # 主动末页判定：任意一页正常返回都能用 total 反推真实末页，收窄有效页数
             effective_max = self._real_last_page(analysis, effective_max)
@@ -914,6 +950,7 @@ class Job51Collector:
                 if not rate_limiter.wait_before_request(hooks.stop_event):
                     return
                 fp_a = self._fetch_page(host_target, kw_encoded, area, fp)
+                scan_cache[fp] = fp_a
                 if not fp_a["ok"]:
                     if fp_a.get("signal") == "empty_items":
                         real_last = self._real_last_page(fp_a, effective_max)
@@ -945,10 +982,15 @@ class Job51Collector:
 
         # 探针全空 → 饱和：把断点记到有效末页，避免下次重复探测（页级断点保留，到期自动失效）
         if not hot_pages:
+            for page, analysis in scan_cache.items():
+                scanned_candidates += self._process_cached_page(
+                    analysis, hooks, city=city, area=area, kw=kw,
+                    allow_internship=allow_internship, salary_min=salary_min, salary_max=salary_max,
+                )
             if self.safety_conn is not None:
                 mark_combo_collected(self.safety_conn, "51job", city, kw)
                 upsert_page_progress(self.safety_conn, "51job", city, kw, effective_max)
-            self._log(hooks, f"51job {kw} 分布式探针全空（已饱和）：命中 {probe_hits or '无'}，跳过 {effective_max} 页",
+            self._log(hooks, f"51job {kw} 已扫描 {scanned_candidates} 条但无新增（全为旧岗位或不符合筛选）：命中 {probe_hits or '无'}，跳过 {effective_max} 页",
                       phase="completed_keyword", keyword=kw, city=city)
             return "saturated"
 
@@ -984,6 +1026,7 @@ class Job51Collector:
                 if not rate_limiter.wait_before_request(hooks.stop_event):
                     return
                 analysis = self._fetch_page(host_target, kw_encoded, area, page)
+                scan_cache[page] = analysis
 
             # 异常分级：末页（翻过第 1 页后为空）正常结束本词，其余立即停止
             if not analysis["ok"]:
@@ -1007,6 +1050,7 @@ class Job51Collector:
                 cand = self._item_to_candidate(item, city, area, kw)
                 if cand is None:
                     continue
+                scanned_candidates += 1
                 # collector 增值层过滤（官方无：实习 / 相关性 / 薪资）
                 filter_reason = self._collector_filter_reason(cand, kw, allow_internship=allow_internship,
                                                              salary_min=salary_min, salary_max=salary_max)
@@ -1019,6 +1063,7 @@ class Job51Collector:
                 # 官方统一层：jd deal_breakers + 入库；返回 False = 应停止
                 if not hooks.on_candidate(cand):
                     raise CollectionBlockedError("callback_stopped", "采集回调已停止")
+            processed_pages.add(page)
 
             # 页级断点：每采完一页立即记录页码
             if self.safety_conn is not None:
@@ -1033,9 +1078,19 @@ class Job51Collector:
                     upsert_page_progress(self.safety_conn, "51job", city, kw, max_pages)
                 break
 
+        for page, analysis in scan_cache.items():
+            if page in processed_pages or not analysis.get("ok"):
+                continue
+            scanned_candidates += self._process_cached_page(
+                analysis, hooks, city=city, area=area, kw=kw,
+                allow_internship=allow_internship, salary_min=salary_min, salary_max=salary_max,
+            )
+
         # 词结束：标记词级断点；页级断点保留（空页时已推进到上限页），到期自动失效
         if self.safety_conn is not None:
             mark_combo_collected(self.safety_conn, "51job", city, kw)
+        self._log(hooks, f"51job {kw} 本轮已扫描 {scanned_candidates} 条",
+                  phase="completed_keyword", keyword=kw, city=city)
         return "resumed" if saved_page > 0 else "scanned"
 
     @staticmethod

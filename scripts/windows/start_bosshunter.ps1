@@ -32,8 +32,8 @@ param(
 	[int]$AutoExitSeconds = 0,
 	[string[]]$PlatformUrls = @(
 		"https://www.zhipin.com",
-		"https://www.zhaopin.com",
-		"https://www.51job.com",
+		"https://www.zhaopin.com/nanjing/",
+		"http://51job.com/nanjing",
 		"https://c.liepin.com/?time=1789092279907"
 	),
 	[int]$WorkbenchPort = 8686,

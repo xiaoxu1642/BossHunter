@@ -76,6 +76,12 @@ class _BlockedCollector:
         return PlatformCollectionResult(self.platform, "blocked", self.reason_code, "平台已阻断")
 
 
+class _SkippedCollector(_BlockedCollector):
+    def collect(self, request, hooks: CollectorHooks):
+        super().collect(request, hooks)
+        return PlatformCollectionResult(self.platform, "skipped", self.reason_code, "已跳过猎聘，其他平台任务继续")
+
+
 class IgnoreCheckpointOptionsTests(TestCase):
     def test_flag_survives_normalization(self):
         options = normalize_collection_options(
@@ -336,6 +342,23 @@ class CollectionOrchestratorTests(TestCase):
         self.assertEqual(result["status"], "completed_with_errors")
         self.assertEqual(result["platforms"]["zhilian"]["reason_code"], "login_required")
         self.assertEqual(result["platforms"]["boss"]["new"], 1)
+
+    def test_liepin_risk_skip_does_not_stop_later_platforms(self):
+        events = []
+        registry = CollectorRegistry({
+            "liepin": lambda: _SkippedCollector("liepin", events, "liepin_risk_skipped"),
+            "boss": lambda: _FakeCollector("boss", events, [_candidate("boss", "boss-after-liepin")]),
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("bosshunter.ai.scorer.score_jobs") as score_jobs:
+                result = CollectionOrchestrator(
+                    {}, db_path=Path(tmp) / "collection.db", registry=registry
+                ).run(_options(order=["liepin", "boss"], auto_score=True))
+
+        self.assertEqual(events, ["start:liepin", "start:boss"])
+        self.assertEqual(result["status"], "completed_with_shortage")
+        self.assertEqual(result["platforms"]["boss"]["new"], 1)
+        score_jobs.assert_called_once()
 
     def test_non_login_block_still_stops_the_remaining_queue(self):
         events = []

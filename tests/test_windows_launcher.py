@@ -57,6 +57,8 @@ class WindowsLauncherTests(unittest.TestCase):
 		self.assertIn("zhaopin.com", text)
 		self.assertIn("51job.com", text)
 		self.assertIn("liepin.com", text)
+		self.assertIn('"https://www.zhaopin.com/nanjing/"', text)
+		self.assertIn('"http://51job.com/nanjing"', text)
 		# 平台 URL 必须真的随 Chrome 一起启动，而不是只写在参数默认值里。
 		chrome_args = [line for line in text.splitlines() if "$ChromeArguments + $PlatformUrls" in line]
 		self.assertTrue(chrome_args, "Chrome 启动参数必须拼接 $PlatformUrls")

@@ -3,7 +3,8 @@
 Collection only. It does not solve verification challenges, imitate human
 behaviour, send messages, or resume automatically after a risk signal. Any
 verification wall, silent throttle, or unexpected page state stops the current
-platform run (fail-closed), following the same boundary as the 51job collector.
+platform run (fail-closed) and lets the shared orchestrator skip Liepin while
+continuing the remaining platforms.
 
 Verified live 2026-08-26:
 - Search URL filters by city via the ``dqs`` parameter (the ``city`` parameter
@@ -80,6 +81,7 @@ _INTERNSHIP_TITLE_TERMS = ("实习", "intern", "internship")  # 本地定制：�
 #   3) 302 到 safe.liepin.com/.../captchaPage_PC——详情页解析必然失败；
 #   4) 页面被安全脚本清空为 about:blank——原实现误判成 login_required，
 #      连续 3 次后转入「只存列表信息」分支继续采集，风险最高。
+# 命中任一形态后只结束猎聘本平台采集；不写全局持久锁，避免后续平台被牵连。
 # 判定写在下方两段提取 JS 里（与既有正则同处，便于对照页面结构改动）。
 
 # 连续详情页登录墙达到该阈值即判定 wow.liepin.com 会话整体失效。
@@ -480,15 +482,19 @@ class LiepinCollector:
         return None
 
     def _record_risk(self, guard: PlatformAccessGuard | None, detail: str) -> None:
-        """blocked 时写风险事件与持久锁，下一轮不再立刻重踩。"""
-        if guard is None:
+        """风控时记录风险事件；猎聘本轮跳过，不冻结其他平台。"""
+        if self.safety_conn is None:
             return
         try:
-            if self.safety_conn is not None:
-                add_risk_event(self.safety_conn, "collection_liepin_rate_limit", detail)
-            guard.lock("rate_limit")
-        except PlatformSafetyStop:
+            add_risk_event(self.safety_conn, "collection_liepin_rate_limit", detail)
+        except Exception:  # noqa: BLE001 - 风险日志失败不改变跳过决策
             pass
+
+    @staticmethod
+    def _risk_skipped_result(detail: str) -> PlatformCollectionResult:
+        return PlatformCollectionResult(
+            "liepin", "skipped", "liepin_risk_skipped", f"{detail}，已跳过猎聘，其他平台任务继续",
+        )
 
     def _http_detail_enabled(self) -> bool:
         """详情页是否走纯 HTTP（默认开启）。
@@ -661,8 +667,8 @@ class LiepinCollector:
                                 if status == "blanked"
                                 else "猎聘搜索列表出现验证或限流信号"
                             )
-                            self._record_risk(guard, f"{risk_detail}，已停止整个平台任务")
-                            return PlatformCollectionResult(self.platform, "blocked", "rate_limit", f"{risk_detail}，已停止整个平台任务")
+                            self._record_risk(guard, risk_detail)
+                            return self._risk_skipped_result(risk_detail)
                         if status == "empty":
                             # 本词已无更多结果：断点推进到上限页，下次直接跳过本词
                             if self.safety_conn is not None:
@@ -763,11 +769,8 @@ class LiepinCollector:
                                     detail_since_break += 1
                                     if http_result.status in {"blocked", "blanked"}:
                                         risk_detail = "猎聘详情页出现验证或限流(HTTP)"
-                                        self._record_risk(guard, f"{risk_detail}，已停止整个平台任务")
-                                        return PlatformCollectionResult(
-                                            self.platform, "blocked", "rate_limit",
-                                            f"{risk_detail}，已停止整个平台任务",
-                                        )
+                                        self._record_risk(guard, risk_detail)
+                                        return self._risk_skipped_result(risk_detail)
                                     if http_result.status == "offline":
                                         consecutive_login_required = 0
                                         hooks.on_parse_failed("猎聘岗位已下线")
@@ -832,8 +835,8 @@ class LiepinCollector:
                                     if detail_status == "blanked"
                                     else "猎聘详情页出现验证或限流"
                                 )
-                                self._record_risk(guard, f"{risk_detail}，已停止整个平台任务")
-                                return PlatformCollectionResult(self.platform, "blocked", "rate_limit", f"{risk_detail}，已停止整个平台任务")
+                                self._record_risk(guard, risk_detail)
+                                return self._risk_skipped_result(risk_detail)
                             if detail_status == "offline":
                                 consecutive_login_required = 0
                                 hooks.on_parse_failed("猎聘岗位已下线")

@@ -237,8 +237,8 @@ def _number(value: Any, fallback: int) -> int:
 def _validated_string_list(field: str, value: Any) -> list[str]:
     if not isinstance(value, list):
         raise AgentRequestError(f"{field} 必须是字符串列表")
-    if len(value) > 30:
-        raise AgentRequestError(f"{field} 最多包含 30 项")
+    if len(value) > 200:
+        raise AgentRequestError(f"{field} 最多包含 200 项")
     result: list[str] = []
     for item in value:
         if not isinstance(item, str):

@@ -818,7 +818,7 @@ class CollectEntryTests(TestCase):
         request = PlatformCollectionRequest(
             "51job", ["AI"], ["上海"], {"上海": "020000"}, max_pages=1,
         )
-        collector = Job51Collector()
+        collector = Job51Collector(browser=Job51Browser(close_tab=Mock(return_value=True)))
         with (
             patch("bosshunter.collection.platforms.job51.SendWindowChecker.is_active", return_value=True),
             patch("bosshunter.collection.platforms.job51.should_take_day_off", return_value=False),
@@ -930,7 +930,10 @@ class CollectSalaryParseErrorTests(TestCase):
         request = PlatformCollectionRequest(
             "51job", ["AI"], ["上海"], {"上海": "020000"}, max_pages=1,
         )
-        collector = Job51Collector(config={"profile": {"salary_min": "abc", "salary_max": "xyz"}})
+        collector = Job51Collector(
+            config={"profile": {"salary_min": "abc", "salary_max": "xyz"}},
+            browser=Job51Browser(close_tab=Mock(return_value=True)),
+        )
         with (
             patch("bosshunter.collection.platforms.job51.SendWindowChecker.is_active", return_value=True),
             patch("bosshunter.collection.platforms.job51.should_take_day_off", return_value=False),
@@ -1008,3 +1011,40 @@ class Job51FilterRegressionTests(TestCase):
             conn = get_db(db_path)
             self.assertEqual(conn.execute("select count(*) from jobs").fetchone()[0], 5)
             conn.close()
+
+    def test_saturated_probe_still_counts_seen_and_duplicates(self):
+        import tempfile
+        from pathlib import Path
+        from bosshunter.collection.platforms.job51 import _ApiRateLimiter
+        from bosshunter.collection.orchestrator import CollectionOrchestrator
+        from bosshunter.db import get_db, insert_job
+
+        items = [{"jobId": "existing", "jobName": "IT 运维工程师", "provideSalaryString": "12-20K",
+                  "fullCompanyName": "示例公司"}]
+        wrapper = json.dumps({"http_status": 200, "content_type": "application/json", "body": _ok_body(items, total=0)})
+        browser = Job51Browser(evaluate=Mock(return_value=wrapper), close_tab=Mock())
+        profile = {"salary_min": 12, "salary_max": 20, "filter_unparsed_salary": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "isolated.db"
+            conn = get_db(db_path)
+            try:
+                insert_job(conn, Job51Collector._item_to_candidate(items[0], "上海", "020000", "IT运维").as_job_record())
+            finally:
+                conn.close()
+            with (
+                patch("bosshunter.collection.platforms.job51.Job51Browser", return_value=browser),
+                patch.object(Job51Collector, "_ensure_host_tab", return_value=("fake", False)),
+                patch("bosshunter.collection.platforms.job51.SendWindowChecker.is_active", return_value=True),
+                patch("bosshunter.collection.platforms.job51.should_take_day_off", return_value=False),
+                patch("bosshunter.collection.platforms.job51._wait_or_stop", return_value=False),
+                patch.object(_ApiRateLimiter, "wait_before_request", return_value=True),
+            ):
+                result = CollectionOrchestrator({"profile": profile}, db_path=db_path).run({
+                    "platform_order": ["51job"], "auto_score": False,
+                    "platforms": {"51job": {"keywords": ["IT运维"], "cities": ["上海"],
+                                              "city_codes": {"上海": "020000"}, "max_pages": 1, "sort": "default"}},
+                })
+            state = result["platforms"]["51job"]
+            self.assertEqual(state["new"], 0)
+            self.assertEqual(state["duplicate"], 1)
+            self.assertEqual(state["seen"], 1)
