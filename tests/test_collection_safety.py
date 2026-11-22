@@ -63,6 +63,25 @@ platforms:
         for platform in ("boss", "zhilian", "51job"):
             self.assertNotIn("target_count", config["platforms"][platform]["search"])
 
+    def test_shadow_guard_enforces_limits_without_writing_access_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = get_db(Path(tmp) / "bosshunter.db")
+            try:
+                guard = PlatformAccessGuard(db, DEFAULTS, "collection", shadow_count=True)
+                for _ in range(3):
+                    guard.reserve("search_page", daily_limit=3)
+                self.assertEqual(count_platform_access_today(db, platform="boss"), 0)
+                with self.assertRaises(PlatformSafetyStop) as raised:
+                    guard.reserve("search_page", daily_limit=3)
+                self.assertEqual(raised.exception.reason, "daily_search_page_limit")
+                guard.lock("captcha", minutes=5)
+                self.assertEqual(get_active_platform_safety_lock(db)["reason"], "captcha")
+                with self.assertRaises(PlatformSafetyStop) as raised:
+                    PlatformAccessGuard(db, DEFAULTS, "collection", shadow_count=True).ensure_unlocked()
+                self.assertEqual(raised.exception.reason, "persistent_risk_lock")
+            finally:
+                db.close()
+
     def test_default_budget_allows_search_and_detail_then_preserves_shared_cap(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = get_db(Path(tmp) / "bosshunter.db")

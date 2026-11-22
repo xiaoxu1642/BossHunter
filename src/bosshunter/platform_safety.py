@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import Callable
 
 from bosshunter.db import (
@@ -27,33 +28,47 @@ class PlatformAccessGuard:
     config: dict
     stage: str
     platform: str = "boss"
+    # Shadow mode keeps daily-limit checks intact (including pages reserved in
+    # this run) without writing them to platform_access_events. Safety locks and
+    # risk events are unaffected.
+    shadow_count: bool = False
+    _shadow: dict[str, int] = field(default_factory=lambda: defaultdict(int))
 
     def ensure_unlocked(self) -> None:
         lock = get_active_platform_safety_lock(self.conn)
         if lock:
             raise PlatformSafetyStop("persistent_risk_lock")
 
+    def _today_count(self, *, action: str | None = None) -> int:
+        count = count_platform_access_today(self.conn, platform=self.platform)
+        if action is not None:
+            count = count_platform_access_today(
+                self.conn, platform=self.platform, stage=self.stage, action=action,
+            )
+        if self.shadow_count and action is not None:
+            count += self._shadow[action]
+        elif self.shadow_count:
+            count += sum(self._shadow.values())
+        return count
+
     def check_available(self, action: str, *, daily_limit: int | None = None) -> None:
         """Check original access limits without consuming a page attempt."""
         self.ensure_unlocked()
         safety_cfg = self.config.get("safety", {})
         global_limit = _positive_int(safety_cfg.get("daily_platform_page_limit", 1100), 1100)
-        if count_platform_access_today(self.conn, platform=self.platform) >= global_limit:
+        if self._today_count() >= global_limit:
             raise PlatformSafetyStop("daily_platform_page_limit")
         if daily_limit is not None:
-            stage_count = count_platform_access_today(
-                self.conn,
-                platform=self.platform,
-                stage=self.stage,
-                action=action,
-            )
-            if stage_count >= max(int(daily_limit), 1):
+            if self._today_count(action=action) >= max(int(daily_limit), 1):
                 raise PlatformSafetyStop(f"daily_{action}_limit")
 
     def reserve(self, action: str, *, daily_limit: int | None = None) -> None:
         """Reserve one page-open attempt before navigation."""
         self.check_available(action, daily_limit=daily_limit)
-        add_platform_access(self.conn, self.stage, action, platform=self.platform)
+        if self.shadow_count:
+            self._shadow[action] += 1
+        else:
+            add_platform_access(self.conn, self.stage, action, platform=self.platform)
 
     def lock(self, reason: str, *, minutes: int | None = None) -> None:
         safety_cfg = self.config.get("safety", {})

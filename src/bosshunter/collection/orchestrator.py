@@ -407,10 +407,12 @@ class CollectionOrchestrator:
         registry: CollectorRegistry | None = None,
         run_id: str | None = None,
         task_id: str = "",
+        count_quota: bool = True,
     ):
         self.config = config
         self.db_path = db_path or Path("./data/bosshunter.db")
         self._uses_default_registry = registry is None
+        self.count_quota = count_quota
         self.registry = registry or CollectorRegistry({
             "boss": BossCollector,
             "zhilian": ZhilianCollector,
@@ -515,7 +517,7 @@ class CollectionOrchestrator:
                 )
                 try:
                     collector = (
-                        BossCollector(config=self.config, safety_conn=conn)
+                        BossCollector(config=self.config, safety_conn=conn, shadow_count=not self.count_quota)
                         if platform == "boss" and self._uses_default_registry
                         else Job51Collector(config=self.config, safety_conn=conn)
                         if platform == "51job" and self._uses_default_registry

@@ -362,6 +362,7 @@ class BossCollector:
         randint: Callable[[int, int], int] | None = None,
         config: dict[str, Any] | None = None,
         safety_conn: Any | None = None,
+        shadow_count: bool = False,
         clock: Callable = time.monotonic,
     ):
         self.browser = browser or BossBrowser()
@@ -370,6 +371,7 @@ class BossCollector:
         self.randint = randint or random.SystemRandom().randint
         self.config = config or {}
         self.safety_conn = safety_conn
+        self.shadow_count = shadow_count
         self.clock = clock
 
     @staticmethod
@@ -397,6 +399,7 @@ class BossCollector:
         tracker = None
         current_keyword = ""
         skipped_cities: set[str] = set()
+        stalled_keywords: set[tuple[str, str]] = set()
         last_yield_reason = ""
         consumed_receipt = 0
         partial_cities: set[str] = set()
@@ -420,7 +423,7 @@ class BossCollector:
             delay_min=2.0 * delay_multiplier,
             delay_max=5.0 * delay_multiplier,
         )
-        guard = PlatformAccessGuard(self.safety_conn, self.config, "collection", "boss") if self.safety_conn is not None else None
+        guard = PlatformAccessGuard(self.safety_conn, self.config, "collection", "boss", shadow_count=self.shadow_count) if self.safety_conn is not None else None
         search_limit = _positive_int(collection_cfg.get("daily_search_page_limit", 60), 60)
         detail_limit = _positive_int(collection_cfg.get("daily_detail_page_limit", 900), 900)
         failure_limit = _positive_int(collection_cfg.get("max_consecutive_page_failures", 3), 3)
@@ -572,7 +575,7 @@ class BossCollector:
             self.browser.scroll(worker_target, direction="bottom")
             self.browser.evaluate(worker_target, JS_DISPATCH_LIST_SCROLL)
             valid_list_seen = False
-            for _ in range(10):
+            for _ in range(20):
                 if wait(0.5 * delay_multiplier):
                     raise ListStopped(make_result(self.platform, "stopped", "user_stopped", "用户已停止"))
                 signal = inspect_risk(worker_target)
@@ -621,6 +624,28 @@ class BossCollector:
             index = request.keywords.index(current_keyword) if current_keyword in request.keywords else start
             tracker.state["next_keyword_index"] = ((index + 1) if status in {"low_yield", "yielded_no_ids"} else (start + 1)) % len(request.keywords)
             publish()
+
+        def yield_keyword(reason: str) -> None:
+            # A stalled pagination is local to one keyword. Try the remaining
+            # keywords in this city before yielding the whole city, otherwise a
+            # single-city setup would end the run after one bad search.
+            nonlocal last_yield_reason
+            check_limits()
+            last_yield_reason = reason
+            partial_cities.add(active_city)
+            stalled_keywords.add((active_city, current_keyword))
+            remaining = [kw for c, _, kw in combos
+                         if c == active_city and (c, kw) not in stalled_keywords]
+            if remaining:
+                hooks.on_event(reason_code=reason, keyword=current_keyword, city=active_city,
+                               message=f"BOSS {current_keyword}：{reason}，切换本城其他关键词重试")
+            else:
+                # Every keyword stalled: the city is exhausted for this run.
+                finish_city("yielded_no_ids", reason)
+                skipped_cities.add(active_city)
+                hooks.on_event(reason_code=reason, city=active_city,
+                               message=f"BOSS {active_city}：全部关键词均无新 ID，跳过本城剩余搜索")
+            raise CityYielded()
 
         def yield_city(reason: str, status: str = "yielded_no_ids") -> None:
             nonlocal last_yield_reason
@@ -792,7 +817,7 @@ class BossCollector:
                             return limited(exc.reason)
                         except ListStopped as exc:
                             if exc.result.reason_code == "search_page_not_advanced":
-                                yield_city(exc.result.reason_code)
+                                yield_keyword(exc.result.reason_code)
                             return exc.result
                         if not isinstance(jobs, list):
                             combo_complete = False
@@ -812,7 +837,7 @@ class BossCollector:
                                 return trigger_risk(signal)
                             if self.browser.evaluate(worker_target, JS_SEARCH_READY) is not True:
                                 return make_result(self.platform, "failed", "list_load_unconfirmed", "BOSS 空列表尚未可靠加载，等待检查")
-                            yield_city("no_jobs_for_search")
+                            yield_keyword("no_jobs_for_search")
                         fingerprint = frozenset(list_ids(jobs))
                         if fingerprint and fingerprint in page_fingerprints:
                             hooks.on_parse_failed("BOSS 翻页未生效：岗位 ID 与之前页面完全相同")
@@ -821,7 +846,7 @@ class BossCollector:
                                 return make_result(self.platform, "stopped", "user_stopped", "用户已停止")
                             if signal:
                                 return trigger_risk(signal)
-                            yield_city("repeated_search_page")
+                            yield_keyword("repeated_search_page")
                         if fingerprint:
                             page_fingerprints.add(fingerprint)
                         schedule()
