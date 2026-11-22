@@ -8,7 +8,7 @@
 <h1 align="center">BossHunter v2.4.0</h1>
 
 <p align="center">
-  某直聘智能求职 Agent：本地完成岗位采集、AI 评分、人工确认投递、回复监测与定制简历生成。
+  招聘平台智能求职 Agent：本地完成岗位采集、AI 评分、人工确认投递、回复监测与定制简历生成。
 </p>
 
 <p align="center">
@@ -124,6 +124,9 @@ bosshunter run
 
 </details>
 
+<details>
+<summary>维护者与贡献榜</summary>
+
 ## 🧭 现任维护者
 
 包括项目负责人在内的 5 名正式维护者共同维护全项目，不设置固定模块；擅长方向仅用于协作参考。
@@ -178,6 +181,8 @@ bosshunter run
 
 [查看完整榜单、证据链接与历月快照](CONTRIBUTORS.md)
 
+</details>
+
 ## 许可证
 
 本项目源码公开，采用 [PolyForm Noncommercial License 1.0.0](LICENSE)。许可证允许符合其定义的非商业用途，以及为这些用途修改和分发本软件；商业使用不在该许可证的授权范围内，需事先取得另行书面授权。
@@ -186,7 +191,7 @@ bosshunter run
 
 ## 参与项目
 
-欢迎 [Star](https://github.com/shengjidaguai-china/BossHunter/stargazers)、提交 [Issue](https://github.com/shengjidaguai-china/BossHunter/issues) 或 Pull Request。大改动建议先开 Issue 讨论。
+欢迎提交 [Issue](https://github.com/shengjidaguai-china/BossHunter/issues) 或 Pull Request。大改动建议先开 Issue 讨论。
 
 - 不接受绕过平台安全机制、规避检测或提高默认发送频率的 PR。
 - 不接受绕过人工确认，或收集、上传、外发用户隐私数据的 PR。
